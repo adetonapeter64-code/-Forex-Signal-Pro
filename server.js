@@ -67,8 +67,8 @@ const MAX_SIGNAL_HISTORY = 150;
 const botStartedAt = Date.now();
 
 const SIGNAL_COOLDOWN_MS = 30 * 60 * 1000; // rest period per-pair after a signal closes
-const TP_PIPS_MIN = 500;
-const TP_PIPS_MAX = 700;
+const TP_PIPS_MIN = 50;
+const TP_PIPS_MAX = 70;
 
 
 // ===============================
@@ -438,7 +438,7 @@ ${PAIRS.map(p => `• ${p}`).join("\n")}
 
 📊 Market structure analysis
 🚨 Entry alerts per pair
-🎯 500-700 pip targets
+🎯 50-70 pip targets
 🛡️ Risk levels
 
 Choose an option below:`,
@@ -501,7 +501,7 @@ Each pair is analyzed independently every 15 minutes on 5-minute candles:
 🟨 Fair Value Gap
 🟦 Order Block
 ✅ Retest + confirmation candle before entry
-🎯 500-700 pip target
+🎯 50-70 pip target
 🛡️ Stop loss from the order block / structure point
 
 ⏳ Refresh happens every 15 minutes (free data plan limit), so signals can lag slightly behind the live price.
@@ -520,7 +520,7 @@ Each pair is analyzed independently every 15 minutes on 5-minute candles:
 ${PAIRS.join(", ")}
 
 🎯 Target
-500-700 pips per trade
+50-70 pips per trade
 
 ⏱️ Refresh
 Every 15 minutes
