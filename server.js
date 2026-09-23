@@ -72,14 +72,46 @@ const TP_PIPS_MAX = 70;
 
 
 // ===============================
+// PERMANENT RECIPIENTS
+// ===============================
+// Set SIGNAL_CHAT_IDS in Render's Environment tab as a comma-separated
+// list of chat / channel IDs (e.g. 123456789,-1001234567890). These
+// IDs are loaded on every startup, so signals keep flowing to them
+// after a restart or free-tier spin-down with no clicking needed.
+// ===============================
+
+(process.env.SIGNAL_CHAT_IDS || "")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean)
+  .forEach(id => {
+    subscribers.set(Number(id), {
+      username: null,
+      firstName: "Permanent",
+      joinedAt: Date.now()
+    });
+  });
+
+// Anyone who messages the bot is subscribed automatically.
+function autoSubscribe(msg) {
+  const id = msg.chat.id;
+  if (subscribers.has(id)) return;
+  subscribers.set(id, {
+    username: msg.from?.username || null,
+    firstName: msg.from?.first_name || "Unknown",
+    joinedAt: Date.now()
+  });
+}
+
+
+// ===============================
 // BOT MENU
 // ===============================
 
 const mainMenu = {
   reply_markup: {
     keyboard: [
-      ["📊 Market Status", "🔔 Auto Signals"],
-      ["🔕 Stop Alerts", "📖 How It Works"],
+      ["📊 Market Status", "📖 How It Works"],
       ["⚙️ Settings"]
     ],
     resize_keyboard: true,
@@ -202,33 +234,6 @@ function hasOpenSignal(pair) {
   return signalHistory.some(s => s.pair === pair && s.status === "open");
 }
 
-// ================================================================
-// SETUP RUNNING NOTIFICATION
-// ================================================================
-// Fires once, the moment a setup is first detected on a pair -
-// before it's confirmed and traded. Separate heads-up from the
-// final entry signal.
-// ================================================================
-
-function notifySetupRunning(pair, setup) {
-  const directionLabel = setup.direction === "bullish" ? "BUY" : "SELL";
-
-  const message =
-`🟢 ${pair} SETUP IS RUNNING
-
-A ${setup.label} has been detected (${directionLabel} bias).
-
-👀 Watching for price to retrace into the zone with a confirming candle before sending the actual entry signal.
-
-This is a heads-up, not an entry yet.`;
-
-  for (const chatId of subscribers.keys()) {
-    bot.sendMessage(chatId, message).catch(err => {
-      console.error(`Failed to send setup-running notice to ${chatId}:`, err.message);
-    });
-  }
-}
-
 function analyzePair(pair) {
   const state = market[pair];
   const candles = state.candles;
@@ -257,6 +262,8 @@ function analyzePair(pair) {
   const brokeAboveHigh = latestClose > lastHigh.price;
   const brokeBelowLow = latestClose < lastLow.price;
 
+  // A detected setup is tracked silently - subscribers only receive
+  // the actual entry signal once it is confirmed.
   if (brokeAboveHigh && !state.pendingSetup) {
     const fvg = findFVG(candles, latestIndex, "bullish");
     if (fvg) {
@@ -269,7 +276,6 @@ function analyzePair(pair) {
         createdAt: Date.now()
       };
       console.log(`[${pair}] Bullish ${state.pendingSetup.label} detected @ ${latestClose}`);
-      notifySetupRunning(pair, state.pendingSetup);
     }
   }
 
@@ -285,7 +291,6 @@ function analyzePair(pair) {
         createdAt: Date.now()
       };
       console.log(`[${pair}] Bearish ${state.pendingSetup.label} detected @ ${latestClose}`);
-      notifySetupRunning(pair, state.pendingSetup);
     }
   }
 
@@ -456,12 +461,8 @@ runCycle();
 // ===============================
 
 bot.onText(/\/start/, (msg) => {
-  // Auto-subscribe on /start - no need to tap "Auto Signals" separately.
-  subscribers.set(msg.chat.id, {
-    username: msg.from.username || null,
-    firstName: msg.from.first_name || "Unknown",
-    joinedAt: subscribers.has(msg.chat.id) ? subscribers.get(msg.chat.id).joinedAt : Date.now()
-  });
+  // Subscribed automatically - nothing for the user to tap.
+  autoSubscribe(msg);
 
   bot.sendMessage(
     msg.chat.id,
@@ -477,7 +478,7 @@ ${PAIRS.map(p => `• ${p}`).join("\n")}
 🎯 50-70 pip targets
 🛡️ Risk levels
 
-🔔 Auto Signals is ON by default - you're already subscribed, no need to tap anything.
+🔔 Automatic signals are already ON for you - no setup needed. You'll receive every entry alert here.
 
 Choose an option below:`,
     mainMenu
@@ -486,6 +487,9 @@ Choose an option below:`,
 
 bot.on("message", async (msg) => {
   if (!msg.text) return;
+
+  // Anyone who messages the bot is subscribed automatically
+  autoSubscribe(msg);
 
   if (msg.text === "📊 Market Status") {
     const lines = PAIRS.map(pair => {
@@ -505,29 +509,6 @@ bot.on("message", async (msg) => {
     bot.sendMessage(msg.chat.id, `📊 MARKET STATUS\n\n${lines.join("\n")}`);
   }
 
-  if (msg.text === "🔔 Auto Signals") {
-    subscribers.set(msg.chat.id, {
-      username: msg.from.username || null,
-      firstName: msg.from.first_name || "Unknown",
-      joinedAt: subscribers.has(msg.chat.id) ? subscribers.get(msg.chat.id).joinedAt : Date.now()
-    });
-
-    bot.sendMessage(
-      msg.chat.id,
-`🔔 AUTOMATIC SIGNALS ENABLED
-
-You'll get an alert the moment any of these confirms a full setup:
-${PAIRS.map(p => `• ${p}`).join("\n")}
-
-Each pair is tracked independently - only one open trade per pair at a time, and you'll get a result (win/loss) before that pair looks for its next setup.`
-    );
-  }
-
-  if (msg.text === "🔕 Stop Alerts") {
-    subscribers.delete(msg.chat.id);
-    bot.sendMessage(msg.chat.id, "🔕 Automatic signals stopped. Turn them back on anytime with 🔔 Auto Signals.");
-  }
-
   if (msg.text === "📖 How It Works") {
     bot.sendMessage(
       msg.chat.id,
@@ -541,6 +522,8 @@ Each pair is analyzed independently every 15 minutes on 5-minute candles:
 ✅ Retest + confirmation candle before entry
 🎯 50-70 pip target
 🛡️ Stop loss from the order block / structure point
+
+🔔 Signals are sent automatically to every user. Automatic signals are always on - nothing to switch on.
 
 ⏳ Refresh happens every 15 minutes (free data plan limit), so signals can lag slightly behind the live price.
 
@@ -559,6 +542,9 @@ ${PAIRS.join(", ")}
 
 🎯 Target
 50-70 pips per trade
+
+🔔 Automatic Alerts
+Always on
 
 ⏱️ Refresh
 Every 15 minutes
@@ -710,6 +696,24 @@ app.post("/admin/broadcast", requireAdminAuth, async (req, res) => {
     }
   }
   res.redirect("/admin");
+});
+
+
+// ===============================
+// CLEAN SHUTDOWN
+// ===============================
+// When Render redeploys, it tells the old copy to stop. Stopping
+// Telegram polling cleanly first avoids the "409 Conflict" error
+// caused by two copies of the bot polling at the same time.
+// ===============================
+
+process.on("SIGTERM", async () => {
+  try {
+    await bot.stopPolling();
+  } catch (err) {
+    console.error("Error stopping polling:", err.message);
+  }
+  process.exit(0);
 });
 
 
