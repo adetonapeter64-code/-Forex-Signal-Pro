@@ -202,6 +202,33 @@ function hasOpenSignal(pair) {
   return signalHistory.some(s => s.pair === pair && s.status === "open");
 }
 
+// ================================================================
+// SETUP RUNNING NOTIFICATION
+// ================================================================
+// Fires once, the moment a setup is first detected on a pair -
+// before it's confirmed and traded. Separate heads-up from the
+// final entry signal.
+// ================================================================
+
+function notifySetupRunning(pair, setup) {
+  const directionLabel = setup.direction === "bullish" ? "BUY" : "SELL";
+
+  const message =
+`🟢 ${pair} SETUP IS RUNNING
+
+A ${setup.label} has been detected (${directionLabel} bias).
+
+👀 Watching for price to retrace into the zone with a confirming candle before sending the actual entry signal.
+
+This is a heads-up, not an entry yet.`;
+
+  for (const chatId of subscribers.keys()) {
+    bot.sendMessage(chatId, message).catch(err => {
+      console.error(`Failed to send setup-running notice to ${chatId}:`, err.message);
+    });
+  }
+}
+
 function analyzePair(pair) {
   const state = market[pair];
   const candles = state.candles;
@@ -242,6 +269,7 @@ function analyzePair(pair) {
         createdAt: Date.now()
       };
       console.log(`[${pair}] Bullish ${state.pendingSetup.label} detected @ ${latestClose}`);
+      notifySetupRunning(pair, state.pendingSetup);
     }
   }
 
@@ -257,6 +285,7 @@ function analyzePair(pair) {
         createdAt: Date.now()
       };
       console.log(`[${pair}] Bearish ${state.pendingSetup.label} detected @ ${latestClose}`);
+      notifySetupRunning(pair, state.pendingSetup);
     }
   }
 
@@ -427,6 +456,13 @@ runCycle();
 // ===============================
 
 bot.onText(/\/start/, (msg) => {
+  // Auto-subscribe on /start - no need to tap "Auto Signals" separately.
+  subscribers.set(msg.chat.id, {
+    username: msg.from.username || null,
+    firstName: msg.from.first_name || "Unknown",
+    joinedAt: subscribers.has(msg.chat.id) ? subscribers.get(msg.chat.id).joinedAt : Date.now()
+  });
+
   bot.sendMessage(
     msg.chat.id,
 `💱 FOREX SIGNALS BOT
@@ -440,6 +476,8 @@ ${PAIRS.map(p => `• ${p}`).join("\n")}
 🚨 Entry alerts per pair
 🎯 50-70 pip targets
 🛡️ Risk levels
+
+🔔 Auto Signals is ON by default - you're already subscribed, no need to tap anything.
 
 Choose an option below:`,
     mainMenu
