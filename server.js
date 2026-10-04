@@ -1,2273 +1,927 @@
 const TelegramBot = require("node-telegram-bot-api");
 const express = require("express");
 const axios = require("axios");
+const crypto = require("crypto");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-
 const token = process.env.BOT_TOKEN;
 const TWELVE_DATA_API_KEY = process.env.TWELVE_DATA_API_KEY;
 
-if (!token) {
-  console.error("BOT_TOKEN is missing");
-  process.exit(1);
-}
+if (!token) { console.error("BOT_TOKEN is missing"); process.exit(1); }
+if (!TWELVE_DATA_API_KEY) { console.error("TWELVE_DATA_API_KEY is missing"); process.exit(1); }
 
-if (!TWELVE_DATA_API_KEY) {
-  console.error("TWELVE_DATA_API_KEY is missing");
-  process.exit(1);
-}
-
-const bot = new TelegramBot(token, {
-  polling: true
-});
+const bot = new TelegramBot(token, { polling: true });
+bot.on("polling_error", e => console.error("Polling error:", e.message));
 
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-
 // ================================================================
-// ADMIN LOGIN
+// ADMIN LOGIN  (FIX: no more default password)
 // ================================================================
-
 const ADMIN_USER = process.env.ADMIN_USER || "admin";
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "changeme123";
+let ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+if (!ADMIN_PASSWORD) {
+  ADMIN_PASSWORD = crypto.randomBytes(9).toString("hex");
+  console.log("⚠️ ADMIN_PASSWORD not set. Temporary admin password for this run: " + ADMIN_PASSWORD);
+}
 
 function requireAdminAuth(req, res, next) {
-  const authHeader = req.headers.authorization;
-
-  if (!authHeader || !authHeader.startsWith("Basic ")) {
+  const h = req.headers.authorization;
+  if (!h || !h.startsWith("Basic ")) {
     res.set("WWW-Authenticate", 'Basic realm="Admin Panel"');
     return res.status(401).send("Authentication required.");
   }
-
-  const decoded = Buffer
-    .from(authHeader.split(" ")[1], "base64")
-    .toString();
-
-  const [user, pass] = decoded.split(":");
-
-  if (user === ADMIN_USER && pass === ADMIN_PASSWORD) {
-    return next();
-  }
-
+  const decoded = Buffer.from(h.split(" ")[1], "base64").toString();
+  const sep = decoded.indexOf(":");
+  const user = sep >= 0 ? decoded.slice(0, sep) : decoded;
+  const pass = sep >= 0 ? decoded.slice(sep + 1) : "";
+  if (user === ADMIN_USER && pass === ADMIN_PASSWORD) return next();
   res.set("WWW-Authenticate", 'Basic realm="Admin Panel"');
   return res.status(401).send("Invalid credentials.");
 }
 
-
 // ================================================================
 // MARKETS
 // ================================================================
-
-const PAIRS = [
-  "EUR/USD",
-  "GBP/USD",
-  "USD/JPY",
-  "AUD/USD",
-  "USD/CAD",
-  "EUR/GBP"
-];
-
-function pipSize(pair) {
-  return pair.includes("JPY") ? 0.01 : 0.0001;
-}
-
-function decimalsFor(pair) {
-  return pair.includes("JPY") ? 3 : 5;
-}
-
+const PAIRS = ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD", "EUR/GBP"];
+const pipSize = pair => (pair.includes("JPY") ? 0.01 : 0.0001);
+const decimalsFor = pair => (pair.includes("JPY") ? 3 : 5);
 
 // ================================================================
-// STRATEGY SETTINGS
+// SETTINGS
 // ================================================================
-
 const SETTINGS = {
-
-  // Historical candles
   HTF_INTERVAL: "1h",
   ENTRY_INTERVAL: "15min",
-
-  HTF_CANDLES: 100,
-  ENTRY_CANDLES: 150,
-
-  // Swing detection
+  HTF_CANDLES: 120,
+  ENTRY_CANDLES: 240,
   SWING_LOOKBACK: 2,
-
-  // Minimum displacement candle body
-  MIN_DISPLACEMENT_BODY_RATIO: 0.55,
-
-  // Minimum body relative to recent average body
-  MIN_DISPLACEMENT_MULTIPLIER: 1.15,
-
-  // How far a setup can remain alive
-  SETUP_EXPIRY_MS: 2 * 60 * 60 * 1000,
-
-  // Cooldown after completed signal
-  SIGNAL_COOLDOWN_MS: 30 * 60 * 1000,
-
-  // Minimum reward/risk
-  MIN_RR: 1.8,
-
-  // Maximum spread-like buffer around SL
-  SL_BUFFER_PIPS: 2,
-
-  // Minimum target
-  MIN_TARGET_PIPS: 25,
-
-  // Maximum target
-  MAX_TARGET_PIPS: 100
+  MAX_SWEEP_AGE: 8,
+  MAX_DISPLACEMENT_AFTER_SWEEP: 3,
+  MAX_BOS_AFTER_DISPLACEMENT: 3,
+  MAX_SETUP_AGE_BARS: 6,
+  MIN_DISPLACEMENT_BODY_RATIO: 0.6,
+  MIN_DISPLACEMENT_MULTIPLIER: 1.25,
+  MIN_RETEST_BODY_RATIO: 0.45,
+  MIN_RETEST_CLOSE_POSITION: 0.62,
+  MIN_RR: 2.0,
+  SL_BUFFER_PIPS: 1.5,
+  MIN_TARGET_PIPS: 15,
+  MAX_TARGET_PIPS: 100,
+  SETUP_EXPIRY_MS: 90 * 60 * 1000,
+  SIGNAL_COOLDOWN_MS: 60 * 60 * 1000,
+  MIN_SIGNAL_SCORE: 78,
+  // Twelve Data free plan = 8 credits/minute. 1 call for 6 pairs = 6 credits.
+  API_WAIT_BETWEEN_CALLS_MS: 61 * 1000,
+  // Run each cycle this long after the 15M candle closes
+  CYCLE_DELAY_AFTER_CLOSE_MS: 20 * 1000
 };
 
+const HOUR_MS = 60 * 60 * 1000;
+const QUARTER_MS = 15 * 60 * 1000;
 
 // ================================================================
-// MARKET STATE
+// STATE
 // ================================================================
-
 const market = {};
-
 PAIRS.forEach(pair => {
-
   market[pair] = {
-
-    htfCandles: [],
-    entryCandles: [],
-
-    pendingSetup: null,
-
-    lastSignalTime: 0,
-
-    lastProcessedCandleTime: 0,
-
-    bias: "NEUTRAL",
-
-    structure: "NEUTRAL",
-
-    lastPrice: null,
-
-    lastAnalysis: "Waiting for data"
+    htfCandles: [], entryCandles: [], pendingSetup: null,
+    lastSignalTime: 0, lastProcessedCandleTime: 0,
+    bias: "NEUTRAL", structure: "NEUTRAL", lastPrice: null,
+    lastAnalysis: "Waiting for market data", dataStatus: "WAITING",
+    lastDataUpdate: 0, lastDataError: null, htfLastCandle: 0, entryLastCandle: 0
   };
-
 });
 
-
-// ================================================================
-// USERS
-// ================================================================
-
+let dataRefreshRunning = false;
 const subscribers = new Map();
-
+const unsubscribed = new Set();
 const signalHistory = [];
-
-const MAX_SIGNAL_HISTORY = 200;
-
+const MAX_SIGNAL_HISTORY = 300;
 const botStartedAt = Date.now();
 
-
-// ================================================================
-// PERMANENT CHAT IDS
-// ================================================================
-
-(process.env.SIGNAL_CHAT_IDS || "")
-  .split(",")
-  .map(s => s.trim())
-  .filter(Boolean)
-  .forEach(id => {
-
-    subscribers.set(Number(id), {
-
-      username: null,
-
-      firstName: "Permanent",
-
-      joinedAt: Date.now()
-
-    });
-
-  });
-
-
-function autoSubscribe(msg) {
-
-  const id = msg.chat.id;
-
-  if (subscribers.has(id)) return;
-
-  subscribers.set(id, {
-
-    username: msg.from?.username || null,
-
-    firstName: msg.from?.first_name || "Unknown",
-
-    joinedAt: Date.now()
-
-  });
-
-}
-
-
-// ================================================================
-// TELEGRAM MENU
-// ================================================================
-
-const mainMenu = {
-
-  reply_markup: {
-
-    keyboard: [
-
-      ["📊 Market Status", "📖 How It Works"],
-
-      ["⚙️ Settings"]
-
-    ],
-
-    resize_keyboard: true,
-
-    is_persistent: true
-
-  }
-
-};
-
-
-// ================================================================
-// WEB SERVER
-// ================================================================
-
-app.get("/", (req, res) => {
-
-  res.send("💱 FOREX SIGNAL ENGINE V2 is running.");
-
+(process.env.SIGNAL_CHAT_IDS || "").split(",").map(s => s.trim()).filter(Boolean).forEach(id => {
+  const n = Number(id);
+  if (!Number.isNaN(n)) subscribers.set(n, { username: null, firstName: "Permanent", joinedAt: Date.now() });
 });
 
+function autoSubscribe(msg) {
+  const id = msg.chat.id;
+  if (subscribers.has(id) || unsubscribed.has(id)) return;
+  subscribers.set(id, {
+    username: msg.from?.username || null,
+    firstName: msg.from?.first_name || "Unknown",
+    joinedAt: Date.now()
+  });
+}
+
+const mainMenu = {
+  reply_markup: {
+    keyboard: [
+      ["📊 Market Status", "🔔 Auto Signals"],
+      ["🔕 Stop Alerts", "📖 How It Works"],
+      ["⚙️ Settings"]
+    ],
+    resize_keyboard: true,
+    is_persistent: true
+  }
+};
+
+app.get("/", (req, res) => res.send("💱 FOREX SIGNAL ENGINE V3 is running."));
 
 // ================================================================
-// TWELVE DATA FETCH
+// HELPERS
 // ================================================================
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function isValidCandle(c) {
+  return Number.isFinite(c.open) && Number.isFinite(c.high) &&
+    Number.isFinite(c.low) && Number.isFinite(c.close) && Number.isFinite(c.time);
+}
+
+function intervalMilliseconds(interval) {
+  if (interval === "15min") return QUARTER_MS;
+  if (interval === "1h") return HOUR_MS;
+  return 0;
+}
+
+function closedCandlesOnly(candles, interval) {
+  const d = intervalMilliseconds(interval);
+  if (!d) return candles;
+  const now = Date.now();
+  return candles.filter(c => c.time + d <= now);
+}
+
+// FIX: Twelve Data datetimes are UTC (we request timezone=UTC) - parse them as UTC
+function parseUtc(dt) {
+  let s = String(dt).trim();
+  if (s.length <= 10) s += " 00:00:00";
+  return new Date(s.replace(" ", "T") + "Z").getTime();
+}
+
+// ================================================================
+// TWELVE DATA  (FIX: detects rate-limit errors inside normal 200 responses)
+// ================================================================
+function isRateLimit(d) {
+  if (!d || d.status !== "error") return false;
+  return Number(d.code) === 429 || /credit|limit|minute/i.test(String(d.message || ""));
+}
+
+async function requestTwelveData(interval, outputsize, attempt = 1) {
+  const url =
+    "https://api.twelvedata.com/time_series" +
+    `?symbol=${encodeURIComponent(PAIRS.join(","))}` +
+    `&interval=${encodeURIComponent(interval)}` +
+    `&outputsize=${outputsize}&timezone=UTC` +
+    `&apikey=${encodeURIComponent(TWELVE_DATA_API_KEY)}`;
+
+  try {
+    const response = await axios.get(url, { timeout: 25000 });
+    const d = response.data;
+    if (isRateLimit(d) && attempt < 3) {
+      console.log(`[Twelve Data] Rate limit (${interval}). Waiting 61s, retry ${attempt}...`);
+      await sleep(SETTINGS.API_WAIT_BETWEEN_CALLS_MS);
+      return requestTwelveData(interval, outputsize, attempt + 1);
+    }
+    return d;
+  } catch (error) {
+    if (error.response?.status === 429 && attempt < 3) {
+      console.log(`[Twelve Data] HTTP 429 (${interval}). Waiting 61s, retry ${attempt}...`);
+      await sleep(SETTINGS.API_WAIT_BETWEEN_CALLS_MS);
+      return requestTwelveData(interval, outputsize, attempt + 1);
+    }
+    throw error;
+  }
+}
+
+function parsePairResponse(entry, interval) {
+  if (!entry || entry.status === "error" || !Array.isArray(entry.values)) {
+    return { candles: [], error: String(entry?.message || entry?.code || "No candle data returned") };
+  }
+  const candles = entry.values
+    .map(v => ({
+      open: Number(v.open), high: Number(v.high), low: Number(v.low),
+      close: Number(v.close), time: parseUtc(v.datetime)
+    }))
+    .filter(isValidCandle)
+    .sort((a, b) => a.time - b.time);
+
+  const closed = closedCandlesOnly(candles, interval);
+  if (!closed.length) return { candles: [], error: "No closed candles available yet" };
+  return { candles: closed, error: null };
+}
 
 async function fetchCandles(interval, outputsize) {
-
-  const symbolParam = PAIRS.join(",");
-
-  const url =
-    `https://api.twelvedata.com/time_series` +
-    `?symbol=${encodeURIComponent(symbolParam)}` +
-    `&interval=${encodeURIComponent(interval)}` +
-    `&outputsize=${outputsize}` +
-    `&apikey=${TWELVE_DATA_API_KEY}`;
-
-  const response = await axios.get(url, {
-
-    timeout: 20000
-
-  });
-
-  const data = response.data;
-
-  const perSymbol =
-    PAIRS.length === 1
-      ? { [PAIRS[0]]: data }
-      : data;
-
-  for (const pair of PAIRS) {
-
-    const entry = perSymbol[pair];
-
-    if (
-      !entry ||
-      entry.status === "error" ||
-      !Array.isArray(entry.values)
-    ) {
-
-      console.error(
-        `[${pair}] ${interval} data error:`,
-        entry?.message || "No values"
-      );
-
-      continue;
-
-    }
-
-    const candles = entry.values
-
-      .map(v => ({
-
-        open: Number(v.open),
-
-        high: Number(v.high),
-
-        low: Number(v.low),
-
-        close: Number(v.close),
-
-        time: new Date(v.datetime).getTime()
-
-      }))
-
-      .filter(c =>
-        Number.isFinite(c.open) &&
-        Number.isFinite(c.high) &&
-        Number.isFinite(c.low) &&
-        Number.isFinite(c.close) &&
-        Number.isFinite(c.time)
-      )
-
-      .sort((a, b) => a.time - b.time);
-
-    if (interval === SETTINGS.HTF_INTERVAL) {
-
-      market[pair].htfCandles = candles;
-
-    } else {
-
-      market[pair].entryCandles = candles;
-
-    }
-
+  let data;
+  try {
+    data = await requestTwelveData(interval, outputsize);
+  } catch (error) {
+    const message = error.response?.data?.message || error.message || "Unknown API error";
+    console.error(`[${interval}] Twelve Data request failed:`, message);
+    PAIRS.forEach(p => { market[p].dataStatus = "ERROR"; market[p].lastDataError = String(message); });
+    return false;
   }
 
+  // Whole-request error (bad key, rate limit after retries, etc.)
+  if (data && data.status === "error" && !data[PAIRS[0]]) {
+    const message = data.message || "API error";
+    console.error(`[${interval}] Twelve Data error:`, message);
+    PAIRS.forEach(p => { market[p].dataStatus = "ERROR"; market[p].lastDataError = String(message); });
+    return false;
+  }
+
+  const ok = [];
+  for (const pair of PAIRS) {
+    const parsed = parsePairResponse(data?.[pair], interval);
+    const st = market[pair];
+    if (parsed.candles.length) {
+      const last = parsed.candles[parsed.candles.length - 1].time;
+      if (interval === SETTINGS.HTF_INTERVAL) { st.htfCandles = parsed.candles; st.htfLastCandle = last; }
+      else { st.entryCandles = parsed.candles; st.entryLastCandle = last; }
+      st.lastDataUpdate = Date.now();
+      st.dataStatus = "OK";
+      st.lastDataError = null;
+      ok.push(pair);
+    } else {
+      st.dataStatus = "ERROR";
+      st.lastDataError = parsed.error || "No data";
+    }
+  }
+  console.log(`[DATA] ${interval}: ${ok.length}/${PAIRS.length} pairs loaded`);
+  return ok.length > 0;
 }
 
-
-// ================================================================
-// LOAD ALL MARKET DATA
-// ================================================================
+// FIX: 1H data only fetched when a new 1H candle should exist (saves API credits)
+function needHtfRefresh() {
+  const now = Date.now();
+  return PAIRS.some(p => {
+    const st = market[p];
+    return st.htfCandles.length < 60 || now >= st.htfLastCandle + 2 * HOUR_MS;
+  });
+}
 
 async function fetchAllMarketData() {
-
-  await fetchCandles(
-    SETTINGS.HTF_INTERVAL,
-    SETTINGS.HTF_CANDLES
-  );
-
-  await fetchCandles(
-    SETTINGS.ENTRY_INTERVAL,
-    SETTINGS.ENTRY_CANDLES
-  );
-
+  if (dataRefreshRunning) { console.log("⏳ Data refresh already running"); return; }
+  dataRefreshRunning = true;
+  try {
+    let fetchedHtf = false;
+    if (needHtfRefresh()) {
+      await fetchCandles(SETTINGS.HTF_INTERVAL, SETTINGS.HTF_CANDLES);
+      fetchedHtf = true;
+    }
+    // FIX: wait out the per-minute credit window before the next call
+    if (fetchedHtf) await sleep(SETTINGS.API_WAIT_BETWEEN_CALLS_MS);
+    await fetchCandles(SETTINGS.ENTRY_INTERVAL, SETTINGS.ENTRY_CANDLES);
+  } finally {
+    dataRefreshRunning = false;
+  }
 }
 
-
 // ================================================================
-// SWING DETECTION
+// SWINGS / STRUCTURE
 // ================================================================
-
 function findSwings(candles, lookback = 2) {
-
   const swings = [];
-
-  if (candles.length < lookback * 2 + 3) {
-    return swings;
-  }
-
-  for (
-    let i = lookback;
-    i < candles.length - lookback;
-    i++
-  ) {
-
-    const current = candles[i];
-
-    let isHigh = true;
-    let isLow = true;
-
-    for (
-      let j = i - lookback;
-      j <= i + lookback;
-      j++
-    ) {
-
+  if (candles.length < lookback * 2 + 3) return swings;
+  for (let i = lookback; i < candles.length - lookback; i++) {
+    const cur = candles[i];
+    let isHigh = true, isLow = true;
+    for (let j = i - lookback; j <= i + lookback; j++) {
       if (j === i) continue;
-
-      if (candles[j].high > current.high) {
-        isHigh = false;
-      }
-
-      if (candles[j].low < current.low) {
-        isLow = false;
-      }
-
+      if (candles[j].high > cur.high) isHigh = false;
+      if (candles[j].low < cur.low) isLow = false;
     }
-
-    if (isHigh) {
-
-      swings.push({
-
-        index: i,
-
-        price: current.high,
-
-        type: "high"
-
-      });
-
-    }
-
-    if (isLow) {
-
-      swings.push({
-
-        index: i,
-
-        price: current.low,
-
-        type: "low"
-
-      });
-
-    }
-
+    if (isHigh) swings.push({ index: i, price: cur.high, type: "high" });
+    if (isLow) swings.push({ index: i, price: cur.low, type: "low" });
   }
-
   return swings;
-
 }
-
-
-// ================================================================
-// MARKET STRUCTURE
-// ================================================================
 
 function getStructure(candles) {
-
-  const swings = findSwings(
-    candles,
-    SETTINGS.SWING_LOOKBACK
-  );
-
-  const highs = swings.filter(
-    s => s.type === "high"
-  );
-
-  const lows = swings.filter(
-    s => s.type === "low"
-  );
-
-  if (highs.length < 2 || lows.length < 2) {
-
-    return {
-
-      bias: "NEUTRAL",
-
-      lastHigh: null,
-
-      previousHigh: null,
-
-      lastLow: null,
-
-      previousLow: null
-
-    };
-
-  }
-
-  const lastHigh = highs[highs.length - 1];
-
-  const previousHigh = highs[highs.length - 2];
-
-  const lastLow = lows[lows.length - 1];
-
-  const previousLow = lows[lows.length - 2];
-
-  const bullish =
-    lastHigh.price > previousHigh.price &&
-    lastLow.price > previousLow.price;
-
-  const bearish =
-    lastHigh.price < previousHigh.price &&
-    lastLow.price < previousLow.price;
-
-  return {
-
-    bias: bullish
-      ? "BULLISH"
-      : bearish
-        ? "BEARISH"
-        : "NEUTRAL",
-
-    lastHigh,
-
-    previousHigh,
-
-    lastLow,
-
-    previousLow
-
-  };
-
+  const swings = findSwings(candles, SETTINGS.SWING_LOOKBACK);
+  const highs = swings.filter(s => s.type === "high");
+  const lows = swings.filter(s => s.type === "low");
+  if (highs.length < 2 || lows.length < 2) return { bias: "NEUTRAL" };
+  const lh = highs[highs.length - 1], ph = highs[highs.length - 2];
+  const ll = lows[lows.length - 1], pl = lows[lows.length - 2];
+  const bullish = lh.price > ph.price && ll.price > pl.price;
+  const bearish = lh.price < ph.price && ll.price < pl.price;
+  return { bias: bullish ? "BULLISH" : bearish ? "BEARISH" : "NEUTRAL" };
 }
-
-
-// ================================================================
-// EMA
-// ================================================================
 
 function calculateEMA(candles, period) {
-
   if (candles.length < period) return null;
-
-  const multiplier = 2 / (period + 1);
-
-  let ema = candles
-    .slice(0, period)
-    .reduce((sum, c) => sum + c.close, 0) / period;
-
-  for (let i = period; i < candles.length; i++) {
-
-    ema =
-      (candles[i].close - ema) * multiplier +
-      ema;
-
-  }
-
+  const m = 2 / (period + 1);
+  let ema = candles.slice(0, period).reduce((s, c) => s + c.close, 0) / period;
+  for (let i = period; i < candles.length; i++) ema = (candles[i].close - ema) * m + ema;
   return ema;
-
 }
 
-
-// ================================================================
-// HIGHER TIMEFRAME BIAS
-// ================================================================
+function calculateATR(candles, period = 14) {
+  if (candles.length < period + 1) return null;
+  const trs = [];
+  for (let i = 1; i < candles.length; i++) {
+    const c = candles[i], p = candles[i - 1];
+    trs.push(Math.max(c.high - c.low, Math.abs(c.high - p.close), Math.abs(c.low - p.close)));
+  }
+  if (trs.length < period) return null;
+  const recent = trs.slice(trs.length - period);
+  return recent.reduce((a, b) => a + b, 0) / recent.length;
+}
 
 function getHTFBias(candles) {
-
-  if (candles.length < 55) {
-    return "NEUTRAL";
-  }
-
+  if (candles.length < 60) return { bias: "NEUTRAL", score: 0, structure: "NEUTRAL", ema20: null, ema50: null };
   const structure = getStructure(candles);
-
   const ema20 = calculateEMA(candles, 20);
-
   const ema50 = calculateEMA(candles, 50);
-
-  const lastClose =
-    candles[candles.length - 1].close;
-
+  const last = candles[candles.length - 1];
   let score = 0;
-
   if (structure.bias === "BULLISH") score += 2;
-
   if (structure.bias === "BEARISH") score -= 2;
-
   if (ema20 && ema50) {
-
-    if (
-      ema20 > ema50 &&
-      lastClose > ema20
-    ) {
-
-      score += 1;
-
-    }
-
-    if (
-      ema20 < ema50 &&
-      lastClose < ema20
-    ) {
-
-      score -= 1;
-
-    }
-
+    if (ema20 > ema50 && last.close > ema20) score += 2;
+    if (ema20 < ema50 && last.close < ema20) score -= 2;
   }
-
-  if (score >= 2) return "BULLISH";
-
-  if (score <= -2) return "BEARISH";
-
-  return "NEUTRAL";
-
+  const oldIndex = Math.max(0, candles.length - 6);
+  const oldEma = calculateEMA(candles.slice(0, oldIndex + 1), 20);
+  if (oldEma && ema20) {
+    if (ema20 > oldEma) score += 1;
+    if (ema20 < oldEma) score -= 1;
+  }
+  const bias = score >= 3 ? "BULLISH" : score <= -3 ? "BEARISH" : "NEUTRAL";
+  return { bias, score, structure: structure.bias, ema20, ema50 };
 }
-
 
 // ================================================================
-// CANDLE BODY
+// CANDLE HELPERS
 // ================================================================
+const candleBody = c => Math.abs(c.close - c.open);
+const candleRange = c => c.high - c.low;
+const isBullishCandle = c => c.close > c.open;
+const isBearishCandle = c => c.close < c.open;
 
-function candleBody(candle) {
-
-  return Math.abs(
-    candle.close - candle.open
-  );
-
+function closePosition(c) {
+  const r = candleRange(c);
+  return r <= 0 ? 0.5 : (c.close - c.low) / r;
 }
-
-
-function candleRange(candle) {
-
-  return candle.high - candle.low;
-
-}
-
-
-function isBullishCandle(candle) {
-
-  return candle.close > candle.open;
-
-}
-
-
-function isBearishCandle(candle) {
-
-  return candle.close < candle.open;
-
-}
-
-
-// ================================================================
-// AVERAGE BODY
-// ================================================================
 
 function averageBody(candles, endIndex, count = 10) {
-
-  const start = Math.max(
-    0,
-    endIndex - count
-  );
-
-  const values = [];
-
-  for (
-    let i = start;
-    i < endIndex;
-    i++
-  ) {
-
-    values.push(
-      candleBody(candles[i])
-    );
-
-  }
-
-  if (!values.length) return 0;
-
-  return values.reduce(
-    (a, b) => a + b,
-    0
-  ) / values.length;
-
+  const start = Math.max(0, endIndex - count);
+  const v = [];
+  for (let i = start; i < endIndex; i++) v.push(candleBody(candles[i]));
+  return v.length ? v.reduce((a, b) => a + b, 0) / v.length : 0;
 }
 
-
 // ================================================================
-// LIQUIDITY SWEEP
+// SETUP PIECES
 // ================================================================
-
-function findLiquiditySweep(
-  candles,
-  direction,
-  endIndex
-) {
-
-  const swings = findSwings(
-    candles.slice(
-      0,
-      endIndex + 1
-    ),
-    SETTINGS.SWING_LOOKBACK
-  );
-
-  const highs = swings.filter(
-    s => s.type === "high"
-  );
-
-  const lows = swings.filter(
-    s => s.type === "low"
-  );
-
-  if (
-    highs.length < 2 ||
-    lows.length < 2
-  ) {
-
-    return null;
-
-  }
-
-  const current = candles[endIndex];
+function findLiquiditySweep(candles, direction, endIndex) {
+  if (endIndex < 8) return null;
+  const swings = findSwings(candles.slice(0, endIndex), SETTINGS.SWING_LOOKBACK);
+  const highs = swings.filter(s => s.type === "high");
+  const lows = swings.filter(s => s.type === "low");
+  if (highs.length < 2 || lows.length < 2) return null;
+  const cur = candles[endIndex];
 
   if (direction === "bullish") {
-
-    const target =
-      lows[lows.length - 1];
-
-    if (
-      current.low < target.price &&
-      current.close > target.price
-    ) {
-
-      return {
-
-        type: "sell-side liquidity sweep",
-
-        price: target.price,
-
-        index: endIndex
-
-      };
-
-    }
-
+    const t = lows[lows.length - 1];
+    if (cur.low < t.price && cur.close > t.price)
+      return { type: "SELL-SIDE LIQUIDITY", price: t.price, index: endIndex };
   }
-
   if (direction === "bearish") {
-
-    const target =
-      highs[highs.length - 1];
-
-    if (
-      current.high > target.price &&
-      current.close < target.price
-    ) {
-
-      return {
-
-        type: "buy-side liquidity sweep",
-
-        price: target.price,
-
-        index: endIndex
-
-      };
-
-    }
-
+    const t = highs[highs.length - 1];
+    if (cur.high > t.price && cur.close < t.price)
+      return { type: "BUY-SIDE LIQUIDITY", price: t.price, index: endIndex };
   }
-
   return null;
-
 }
 
-
-// ================================================================
-// DISPLACEMENT
-// ================================================================
-
-function isDisplacement(
-  candles,
-  index,
-  direction
-) {
-
-  if (index < 10) return false;
-
+function isDisplacement(candles, index, direction) {
+  if (index < 10 || index >= candles.length) return false;
   const c = candles[index];
-
   const range = candleRange(c);
-
   if (range <= 0) return false;
-
   const body = candleBody(c);
-
-  const bodyRatio =
-    body / range;
-
-  const avgBody =
-    averageBody(
-      candles,
-      index,
-      10
-    );
-
-  if (
-    bodyRatio <
-    SETTINGS.MIN_DISPLACEMENT_BODY_RATIO
-  ) {
-
-    return false;
-
-  }
-
-  if (
-    avgBody > 0 &&
-    body <
-    avgBody *
-    SETTINGS.MIN_DISPLACEMENT_MULTIPLIER
-  ) {
-
-    return false;
-
-  }
-
-  if (
-    direction === "bullish" &&
-    !isBullishCandle(c)
-  ) {
-
-    return false;
-
-  }
-
-  if (
-    direction === "bearish" &&
-    !isBearishCandle(c)
-  ) {
-
-    return false;
-
-  }
-
+  if (body / range < SETTINGS.MIN_DISPLACEMENT_BODY_RATIO) return false;
+  const avg = averageBody(candles, index, 10);
+  if (avg > 0 && body < avg * SETTINGS.MIN_DISPLACEMENT_MULTIPLIER) return false;
+  if (direction === "bullish" && !isBullishCandle(c)) return false;
+  if (direction === "bearish" && !isBearishCandle(c)) return false;
   return true;
-
 }
 
-
-// ================================================================
-// BOS AFTER LIQUIDITY SWEEP
-// ================================================================
-
-function findStructureBreak(
-  candles,
-  direction,
-  fromIndex
-) {
-
-  const swings = findSwings(
-    candles.slice(
-      0,
-      fromIndex + 1
-    ),
-    SETTINGS.SWING_LOOKBACK
-  );
-
-  const highs = swings.filter(
-    s => s.type === "high"
-  );
-
-  const lows = swings.filter(
-    s => s.type === "low"
-  );
-
-  if (
-    highs.length < 2 ||
-    lows.length < 2
-  ) {
-
-    return null;
-
-  }
+function findStructureBreak(candles, direction, fromIndex) {
+  const end = Math.min(candles.length - 1, fromIndex + SETTINGS.MAX_BOS_AFTER_DISPLACEMENT);
+  const swings = findSwings(candles.slice(0, fromIndex), SETTINGS.SWING_LOOKBACK);
+  const highs = swings.filter(s => s.type === "high");
+  const lows = swings.filter(s => s.type === "low");
+  if (highs.length < 2 || lows.length < 2) return null;
 
   if (direction === "bullish") {
-
-    const target =
-      highs[highs.length - 1];
-
-    for (
-      let i = fromIndex + 1;
-      i < candles.length;
-      i++
-    ) {
-
-      if (
-        candles[i].close >
-        target.price
-      ) {
-
-        return {
-
-          index: i,
-
-          price: target.price,
-
-          type: "BOS"
-
-        };
-
-      }
-
-    }
-
+    const t = highs[highs.length - 1];
+    for (let i = fromIndex + 1; i <= end; i++)
+      if (candles[i].close > t.price) return { index: i, price: t.price, type: "BULLISH CHoCH/BOS" };
   }
-
   if (direction === "bearish") {
-
-    const target =
-      lows[lows.length - 1];
-
-    for (
-      let i = fromIndex + 1;
-      i < candles.length;
-      i++
-    ) {
-
-      if (
-        candles[i].close <
-        target.price
-      ) {
-
-        return {
-
-          index: i,
-
-          price: target.price,
-
-          type: "BOS"
-
-        };
-
-      }
-
-    }
-
+    const t = lows[lows.length - 1];
+    for (let i = fromIndex + 1; i <= end; i++)
+      if (candles[i].close < t.price) return { index: i, price: t.price, type: "BEARISH CHoCH/BOS" };
   }
-
   return null;
-
 }
 
-
-// ================================================================
-// FVG
-// ================================================================
-
-function findFVGAt(
-  candles,
-  index,
-  direction
-) {
-
+function findFVGAt(candles, index, direction) {
   if (index < 2) return null;
-
-  const c1 = candles[index - 2];
-
-  const c2 = candles[index - 1];
-
-  const c3 = candles[index];
-
-  if (direction === "bullish") {
-
-    if (
-      c1.high < c3.low
-    ) {
-
-      return {
-
-        top: c3.low,
-
-        bottom: c1.high,
-
-        index,
-
-        midpoint:
-          (c3.low + c1.high) / 2
-
-      };
-
-    }
-
-  }
-
-  if (direction === "bearish") {
-
-    if (
-      c1.low > c3.high
-    ) {
-
-      return {
-
-        top: c1.low,
-
-        bottom: c3.high,
-
-        index,
-
-        midpoint:
-          (c1.low + c3.high) / 2
-
-      };
-
-    }
-
-  }
-
+  const c1 = candles[index - 2], c3 = candles[index];
+  if (direction === "bullish" && c1.high < c3.low)
+    return { top: c3.low, bottom: c1.high, midpoint: (c3.low + c1.high) / 2, index };
+  if (direction === "bearish" && c1.low > c3.high)
+    return { top: c1.low, bottom: c3.high, midpoint: (c1.low + c3.high) / 2, index };
   return null;
-
 }
 
-
-// ================================================================
-// SUPPLY / DEMAND ZONE
-// ================================================================
-
-function findSupplyDemandZone(
-  candles,
-  displacementIndex,
-  direction
-) {
-
-  const start =
-    Math.max(
-      0,
-      displacementIndex - 6
-    );
-
-  for (
-    let i = displacementIndex - 1;
-    i >= start;
-    i--
-  ) {
-
+function findSupplyDemandZone(candles, displacementIndex, direction) {
+  const start = Math.max(0, displacementIndex - 6);
+  for (let i = displacementIndex - 1; i >= start; i--) {
     const c = candles[i];
-
-    if (
-      direction === "bullish" &&
-      isBearishCandle(c)
-    ) {
-
-      return {
-
-        type: "DEMAND",
-
-        top: c.high,
-
-        bottom: c.low,
-
-        index: i
-
-      };
-
-    }
-
-    if (
-      direction === "bearish" &&
-      isBullishCandle(c)
-    ) {
-
-      return {
-
-        type: "SUPPLY",
-
-        top: c.high,
-
-        bottom: c.low,
-
-        index: i
-
-      };
-
-    }
-
+    if (direction === "bullish" && isBearishCandle(c))
+      return { type: "DEMAND", top: c.high, bottom: c.low, index: i };
+    if (direction === "bearish" && isBullishCandle(c))
+      return { type: "SUPPLY", top: c.high, bottom: c.low, index: i };
   }
-
   return null;
-
 }
 
-
-// ================================================================
-// ORDER BLOCK
-// ================================================================
-
-function findOrderBlock(
-  candles,
-  displacementIndex,
-  direction
-) {
-
-  const zone =
-    findSupplyDemandZone(
-      candles,
-      displacementIndex,
-      direction
-    );
-
-  if (!zone) return null;
-
-  return {
-
-    top: zone.top,
-
-    bottom: zone.bottom,
-
-    index: zone.index,
-
-    type:
-      direction === "bullish"
-        ? "BULLISH OB"
-        : "BEARISH OB"
-
-  };
-
+function findOrderBlock(candles, displacementIndex, direction) {
+  const z = findSupplyDemandZone(candles, displacementIndex, direction);
+  if (!z) return null;
+  return { top: z.top, bottom: z.bottom, index: z.index, type: direction === "bullish" ? "BULLISH OB" : "BEARISH OB" };
 }
-
-
-// ================================================================
-// ZONE OVERLAP
-// ================================================================
 
 function zonesOverlap(a, b) {
-
   if (!a || !b) return false;
-
-  return (
-    Math.max(
-      a.bottom,
-      b.bottom
-    ) <=
-    Math.min(
-      a.top,
-      b.top
-    )
-  );
-
+  return Math.max(a.bottom, b.bottom) <= Math.min(a.top, b.top);
 }
 
+function getEntryZone(setup) {
+  const zones = [setup.supplyDemand, setup.fvg, setup.orderBlock].filter(Boolean);
+  if (!zones.length) return null;
+  let top = Math.min(...zones.map(z => z.top));
+  let bottom = Math.max(...zones.map(z => z.bottom));
+  if (bottom > top) {
+    const p = setup.supplyDemand || setup.orderBlock || setup.fvg;
+    top = p.top; bottom = p.bottom;
+  }
+  return { top, bottom, midpoint: (top + bottom) / 2 };
+}
 
 // ================================================================
 // BUILD SETUP
 // ================================================================
+function buildSetup(pair, candles, htfBias) {
+  if (candles.length < 60) return null;
+  if (htfBias !== "BULLISH" && htfBias !== "BEARISH") return null;
 
-function buildSetup(
-  pair,
-  candles,
-  htfBias
-) {
+  const direction = htfBias === "BULLISH" ? "bullish" : "bearish";
+  const latestIndex = candles.length - 1;
+  const searchStart = Math.max(12, latestIndex - SETTINGS.MAX_SWEEP_AGE);
 
-  if (candles.length < 40) {
-    return null;
-  }
-
-  if (
-    htfBias !== "BULLISH" &&
-    htfBias !== "BEARISH"
-  ) {
-
-    return null;
-
-  }
-
-  const direction =
-    htfBias === "BULLISH"
-      ? "bullish"
-      : "bearish";
-
-  const latestIndex =
-    candles.length - 1;
-
-  /*
-   * Look through recent candles for:
-   *
-   * liquidity sweep
-   * +
-   * displacement
-   * +
-   * BOS
-   */
-
-  const searchStart =
-    Math.max(
-      10,
-      latestIndex - 12
-    );
-
-  for (
-    let sweepIndex = latestIndex;
-    sweepIndex >= searchStart;
-    sweepIndex--
-  ) {
-
-    const sweep =
-      findLiquiditySweep(
-        candles,
-        direction,
-        sweepIndex
-      );
-
+  for (let sweepIndex = latestIndex; sweepIndex >= searchStart; sweepIndex--) {
+    const sweep = findLiquiditySweep(candles, direction, sweepIndex);
     if (!sweep) continue;
 
-    for (
-      let displacementIndex =
-        sweepIndex + 1;
-      displacementIndex <=
-        Math.min(
-          latestIndex,
-          sweepIndex + 4
-        );
-      displacementIndex++
-    ) {
+    const maxDisp = Math.min(latestIndex, sweepIndex + SETTINGS.MAX_DISPLACEMENT_AFTER_SWEEP);
+    for (let d = sweepIndex + 1; d <= maxDisp; d++) {
+      if (!isDisplacement(candles, d, direction)) continue;
 
-      if (
-        !isDisplacement(
-          candles,
-          displacementIndex,
-          direction
-        )
-      ) {
+      const structureBreak = findStructureBreak(candles, direction, d);
+      if (!structureBreak) continue;
+      if (latestIndex - structureBreak.index > SETTINGS.MAX_SETUP_AGE_BARS) continue;
 
-        continue;
-
-      }
-
-      const structureBreak =
-        findStructureBreak(
-          candles,
-          direction,
-          displacementIndex
-        );
-
-      if (!structureBreak) {
-        continue;
-      }
-
-      if (
-        structureBreak.index >
-        latestIndex
-      ) {
-
-        continue;
-
-      }
-
-      const fvg =
-        findFVGAt(
-          candles,
-          displacementIndex,
-          direction
-        );
-
-      const zone =
-        findSupplyDemandZone(
-          candles,
-          displacementIndex,
-          direction
-        );
-
-      const ob =
-        findOrderBlock(
-          candles,
-          displacementIndex,
-          direction
-        );
-
+      const fvg = findFVGAt(candles, d, direction);
+      const zone = findSupplyDemandZone(candles, d, direction);
+      const ob = findOrderBlock(candles, d, direction);
       if (!zone) continue;
+      if (!fvg && !ob) continue;
+      if (fvg && ob && !zonesOverlap(fvg, ob)) continue;
 
-      /*
-       * Require either FVG or OB.
-       * If both exist, preferably they overlap.
-       */
-
-      if (!fvg && !ob) {
-        continue;
-      }
-
-      if (
-        fvg &&
-        ob &&
-        !zonesOverlap(fvg, ob)
-      ) {
-
-        /*
-         * Don't force the trade if the
-         * FVG and OB are unrelated.
-         */
-
-        continue;
-
-      }
-
-      return {
-
-        direction,
-
-        label: structureBreak.type,
-
-        sweep,
-
-        displacementIndex,
-
-        structureBreak,
-
-        fvg,
-
-        supplyDemand: zone,
-
-        orderBlock: ob,
-
+      const setup = {
+        direction, sweep, displacementIndex: d, structureBreak, fvg,
+        supplyDemand: zone, orderBlock: ob,
         createdAt: Date.now(),
-
-        retested: false,
-
-        confirmed: false
-
+        createdCandleTime: candles[structureBreak.index].time,
+        signalScore: 0
       };
-
+      if (!getEntryZone(setup)) continue;
+      return setup;
     }
-
   }
-
   return null;
-
 }
 
-
 // ================================================================
-// CHECK RETEST
+// RETEST / CONFIRMATION
 // ================================================================
+function confirmationCandle(candles, setup) {
+  const zone = getEntryZone(setup);
+  if (!zone) return null;
+  const latestIndex = candles.length - 1;
+  const latest = candles[latestIndex];
+  if (!latest) return null;
+  if (latestIndex <= setup.structureBreak.index) return null;
+  if (latestIndex - setup.structureBreak.index > SETTINGS.MAX_SETUP_AGE_BARS) return null;
 
-function getEntryZone(setup) {
+  const touches = latest.low <= zone.top && latest.high >= zone.bottom;
+  if (!touches) return null;
 
-  const zones = [];
+  const range = candleRange(latest);
+  if (range <= 0) return null;
+  if (candleBody(latest) / range < SETTINGS.MIN_RETEST_BODY_RATIO) return null;
 
-  if (setup.supplyDemand) {
-    zones.push(setup.supplyDemand);
+  if (setup.direction === "bullish") {
+    if (!isBullishCandle(latest)) return null;
+    if (closePosition(latest) < SETTINGS.MIN_RETEST_CLOSE_POSITION) return null;
+    if (latest.close < zone.bottom) return null;
+    return latest;
   }
-
-  if (setup.fvg) {
-    zones.push(setup.fvg);
+  if (setup.direction === "bearish") {
+    if (!isBearishCandle(latest)) return null;
+    if ((latest.high - latest.close) / range < SETTINGS.MIN_RETEST_CLOSE_POSITION) return null;
+    if (latest.close > zone.top) return null;
+    return latest;
   }
-
-  if (setup.orderBlock) {
-    zones.push(setup.orderBlock);
-  }
-
-  if (!zones.length) {
-    return null;
-  }
-
-  let top =
-    Math.min(
-      ...zones.map(z => z.top)
-    );
-
-  let bottom =
-    Math.max(
-      ...zones.map(z => z.bottom)
-    );
-
-  /*
-   * If zones don't mathematically overlap,
-   * use the supply/demand zone.
-   */
-
-  if (bottom > top) {
-
-    const primary =
-      setup.supplyDemand ||
-      setup.orderBlock ||
-      setup.fvg;
-
-    top = primary.top;
-
-    bottom = primary.bottom;
-
-  }
-
-  return {
-
-    top,
-
-    bottom,
-
-    midpoint:
-      (top + bottom) / 2
-
-  };
-
+  return null;
 }
 
+// ================================================================
+// SCORE
+// ================================================================
+function calculateSetupScore(pair, setup, htfInfo, candles, entryPrice) {
+  let score = 0;
+  const reasons = [];
+  const want = setup.direction === "bullish" ? "BULLISH" : "BEARISH";
+
+  if (htfInfo.bias === want) { score += 20; reasons.push("HTF bias aligned"); }
+  if (htfInfo.structure === want) { score += 10; reasons.push("HTF structure aligned"); }
+
+  if (htfInfo.ema20 && htfInfo.ema50) {
+    const aligned = setup.direction === "bullish" ? htfInfo.ema20 > htfInfo.ema50 : htfInfo.ema20 < htfInfo.ema50;
+    if (aligned) { score += 10; reasons.push("EMA alignment"); }
+  }
+  if (setup.sweep) { score += 15; reasons.push("Liquidity sweep"); }
+  if (isDisplacement(candles, setup.displacementIndex, setup.direction)) { score += 15; reasons.push("Strong displacement"); }
+  if (setup.structureBreak) { score += 10; reasons.push("Structure break"); }
+  if (setup.fvg) { score += 5; reasons.push("FVG"); }
+  if (setup.orderBlock) { score += 5; reasons.push("Order Block"); }
+
+  const age = candles.length - 1 - setup.structureBreak.index;
+  if (age <= 2) { score += 5; reasons.push("Fresh setup"); }
+  else if (age > 4) score -= 5;
+
+  const atr = calculateATR(candles, 14);
+  if (atr && entryPrice) {
+    const zone = getEntryZone(setup);
+    if (zone && zone.top - zone.bottom <= atr * 1.2) { score += 5; reasons.push("Clean zone size"); }
+  }
+  return { score: Math.max(0, Math.min(100, score)), reasons };
+}
 
 // ================================================================
-// CONFIRMATION CANDLE
+// TARGETS / LEVELS
 // ================================================================
+function findLiquidityTarget(candles, direction, entryPrice) {
+  const swings = findSwings(candles, SETTINGS.SWING_LOOKBACK);
+  if (!swings.length) return null;
+  if (direction === "bullish") {
+    const highs = swings.filter(s => s.type === "high").map(s => s.price).filter(p => p > entryPrice).sort((a, b) => a - b);
+    return highs[0] || null;
+  }
+  const lows = swings.filter(s => s.type === "low").map(s => s.price).filter(p => p < entryPrice).sort((a, b) => b - a);
+  return lows[0] || null;
+}
 
-function confirmationCandle(
-  candles,
-  setup
-) {
-
-  const zone =
-    getEntryZone(setup);
-
+function calculateTradeLevels(pair, setup, entryPrice, candles) {
+  const pip = pipSize(pair);
+  const buffer = SETTINGS.SL_BUFFER_PIPS * pip;
+  const zone = getEntryZone(setup);
   if (!zone) return null;
 
-  const c =
-    candles[candles.length - 1];
+  const stopLoss = setup.direction === "bullish"
+    ? Math.min(zone.bottom, setup.sweep.price) - buffer
+    : Math.max(zone.top, setup.sweep.price) + buffer;
 
-  if (!c) return null;
+  const risk = Math.abs(entryPrice - stopLoss);
+  if (!Number.isFinite(risk) || risk <= 0) return null;
 
-  const touchesZone =
-    c.low <= zone.top &&
-    c.high >= zone.bottom;
+  const liquidityTarget = findLiquidityTarget(candles, setup.direction, entryPrice);
+  let takeProfit = liquidityTarget;
+  const requiredReward = risk * SETTINGS.MIN_RR;
 
-  if (!touchesZone) {
-    return null;
-  }
-
-  const range =
-    candleRange(c);
-
-  if (range <= 0) {
-    return null;
-  }
-
-  const body =
-    candleBody(c);
-
-  const bodyRatio =
-    body / range;
-
-  if (bodyRatio < 0.45) {
-    return null;
-  }
-
-  if (
-    setup.direction === "bullish"
-  ) {
-
-    if (!isBullishCandle(c)) {
-      return null;
-    }
-
-    /*
-     * Bullish rejection:
-     * candle closes in upper half.
-     */
-
-    const closePosition =
-      (c.close - c.low) / range;
-
-    if (closePosition < 0.60) {
-      return null;
-    }
-
-    return c;
-
-  }
-
-  if (
-    setup.direction === "bearish"
-  ) {
-
-    if (!isBearishCandle(c)) {
-      return null;
-    }
-
-    /*
-     * Bearish rejection:
-     * candle closes in lower half.
-     */
-
-    const closePosition =
-      (c.high - c.close) / range;
-
-    if (closePosition < 0.60) {
-      return null;
-    }
-
-    return c;
-
-  }
-
-  return null;
-
-}
-
-
-// ================================================================
-// TARGET / STOP CALCULATION
-// ================================================================
-
-function calculateTradeLevels(
-  pair,
-  setup,
-  entryPrice
-) {
-
-  const pip =
-    pipSize(pair);
-
-  const buffer =
-    SETTINGS.SL_BUFFER_PIPS * pip;
-
-  const zone =
-    getEntryZone(setup);
-
-  if (!zone) return null;
-
-  let stopLoss;
-
-  if (
-    setup.direction === "bullish"
-  ) {
-
-    const swingLow =
-      setup.sweep?.price ||
-      zone.bottom;
-
-    stopLoss =
-      Math.min(
-        zone.bottom,
-        swingLow
-      ) - buffer;
-
+  if (setup.direction === "bullish") {
+    if (!takeProfit || takeProfit < entryPrice + requiredReward) takeProfit = entryPrice + requiredReward;
   } else {
-
-    const swingHigh =
-      setup.sweep?.price ||
-      zone.top;
-
-    stopLoss =
-      Math.max(
-        zone.top,
-        swingHigh
-      ) + buffer;
-
+    if (!takeProfit || takeProfit > entryPrice - requiredReward) takeProfit = entryPrice - requiredReward;
   }
 
-  const risk =
-    Math.abs(
-      entryPrice - stopLoss
-    );
+  const reward = Math.abs(takeProfit - entryPrice);
+  const rr = reward / risk;
+  const targetPips = reward / pip;
 
-  if (
-    !Number.isFinite(risk) ||
-    risk <= 0
-  ) {
+  if (rr < SETTINGS.MIN_RR) return null;
+  if (targetPips < SETTINGS.MIN_TARGET_PIPS) return null;
+  if (targetPips > SETTINGS.MAX_TARGET_PIPS) return null;
 
-    return null;
-
-  }
-
-  /*
-   * Target is at least 1.8R.
-   */
-
-  const minimumReward =
-    risk * SETTINGS.MIN_RR;
-
-  /*
-   * Convert to pip distance.
-   */
-
-  const minimumPips =
-    minimumReward / pip;
-
-  let targetPips =
-    Math.max(
-      SETTINGS.MIN_TARGET_PIPS,
-      minimumPips
-    );
-
-  targetPips =
-    Math.min(
-      SETTINGS.MAX_TARGET_PIPS,
-      targetPips
-    );
-
-  /*
-   * If 1.8R requires more than our
-   * maximum target, don't take it.
-   */
-
-  if (
-    targetPips <
-    minimumPips
-  ) {
-
-    return null;
-
-  }
-
-  let takeProfit;
-
-  if (
-    setup.direction === "bullish"
-  ) {
-
-    takeProfit =
-      entryPrice +
-      targetPips * pip;
-
-  } else {
-
-    takeProfit =
-      entryPrice -
-      targetPips * pip;
-
-  }
-
-  return {
-
-    stopLoss,
-
-    takeProfit,
-
-    risk,
-
-    targetPips,
-
-    rr:
-      Math.abs(
-        takeProfit - entryPrice
-      ) / risk
-
-  };
-
+  return { stopLoss, takeProfit, risk, reward, targetPips, rr, liquidityTarget: liquidityTarget || null };
 }
 
-
 // ================================================================
-// OPEN SIGNAL CHECK
+// SIGNALS
 // ================================================================
+const hasOpenSignal = pair => signalHistory.some(s => s.pair === pair && s.status === "open");
 
-function hasOpenSignal(pair) {
-
-  return signalHistory.some(
-    s =>
-      s.pair === pair &&
-      s.status === "open"
-  );
-
+function broadcast(text) {
+  for (const chatId of subscribers.keys()) {
+    bot.sendMessage(chatId, text).catch(err => console.error(`Send failed ${chatId}:`, err.message));
+  }
 }
 
+function fireSignal(pair, setup, confirmation, htfInfo) {
+  const state = market[pair];
+  const entryPrice = confirmation.close;
 
-// ================================================================
-// FIRE SIGNAL
-// ================================================================
+  if (Date.now() - state.lastSignalTime < SETTINGS.SIGNAL_COOLDOWN_MS) { state.lastAnalysis = "Cooldown active"; return false; }
+  if (hasOpenSignal(pair)) { state.lastAnalysis = "Signal already open"; return false; }
 
-function fireSignal(
-  pair,
-  setup,
-  entryPrice
-) {
+  const candles = state.entryCandles;
+  const scoreData = calculateSetupScore(pair, setup, htfInfo, candles, entryPrice);
+  setup.signalScore = scoreData.score;
 
-  const state =
-    market[pair];
-
-  if (
-    Date.now() -
-    state.lastSignalTime <
-    SETTINGS.SIGNAL_COOLDOWN_MS
-  ) {
-
-    console.log(
-      `[${pair}] Cooldown active`
-    );
-
-    return;
-
+  if (scoreData.score < SETTINGS.MIN_SIGNAL_SCORE) {
+    state.lastAnalysis = `Setup rejected - score ${scoreData.score}/100`;
+    console.log(`[${pair}] Setup rejected: score ${scoreData.score}`);
+    return false;
   }
 
-  if (hasOpenSignal(pair)) {
-    return;
-  }
-
-  const levels =
-    calculateTradeLevels(
-      pair,
-      setup,
-      entryPrice
-    );
-
+  const levels = calculateTradeLevels(pair, setup, entryPrice, candles);
   if (!levels) {
-
-    console.log(
-      `[${pair}] Trade rejected: bad R:R or SL`
-    );
-
-    return;
-
+    state.lastAnalysis = "Setup rejected - bad target/RR";
+    console.log(`[${pair}] Setup rejected: bad target/RR`);
+    return false;
   }
 
-  const direction =
-    setup.direction === "bullish"
-      ? "BUY"
-      : "SELL";
-
-  const emoji =
-    direction === "BUY"
-      ? "🟢"
-      : "🔴";
-
-  const decimals =
-    decimalsFor(pair);
+  const direction = setup.direction === "bullish" ? "BUY" : "SELL";
+  const emoji = direction === "BUY" ? "🟢" : "🔴";
+  const dec = decimalsFor(pair);
+  const score = scoreData.score;
+  const confidence = score >= 90 ? "🔥 VERY HIGH" : score >= 85 ? "🟢 HIGH" : "🟡 GOOD";
 
   const message =
-`🚨 ${pair} FOREX SIGNAL V2
+`🚨 ${pair} FOREX SIGNAL V3
 
-${emoji} ${direction} @ ${entryPrice.toFixed(decimals)}
+${emoji} ${direction}
+ENTRY: ${entryPrice.toFixed(dec)}
 
-🛡️ Stop Loss:
-${levels.stopLoss.toFixed(decimals)}
+🛡️ SL:
+${levels.stopLoss.toFixed(dec)}
 
-🎯 Take Profit:
-${levels.takeProfit.toFixed(decimals)}
+🎯 TP:
+${levels.takeProfit.toFixed(dec)}
 
-📏 Target:
-~${levels.targetPips.toFixed(0)} pips
-
-📊 CONFIRMATION
-• 1H ${state.bias} bias
-• Liquidity sweep
-• Displacement
-• ${setup.label}
-• ${setup.supplyDemand?.type || "Supply/Demand"}
-• FVG
-• Order Block
-• Retest + confirmation candle
-
-📐 Risk/Reward:
+📐 R:R
 1:${levels.rr.toFixed(2)}
 
-⚠️ Manage your own risk.
-This is not financial advice.`;
+⭐ SETUP SCORE
+${score}/100 — ${confidence}
+
+🧠 CONFIRMATION
+• 1H bias: ${state.bias}
+• 1H structure: ${htfInfo.structure}
+• Liquidity sweep: ✅
+• Displacement: ✅
+• BOS/CHoCH: ✅
+• Supply/Demand: ${setup.supplyDemand?.type || "ZONE"}
+• FVG: ${setup.fvg ? "✅" : "—"}
+• Order Block: ${setup.orderBlock ? "✅" : "—"}
+• Retest: ✅
+• Confirmation candle: ✅
+
+🎯 Target:
+${levels.targetPips.toFixed(1)} pips
+
+⚠️ Risk only what you can afford to lose.
+No strategy guarantees a winning trade.`;
 
   const signal = {
-
-    id:
-      `${Date.now()}-${Math.floor(
-        Math.random() * 10000
-      )}`,
-
-    pair,
-
-    time: Date.now(),
-
-    label: setup.label,
-
-    direction,
-
-    entryPrice,
-
-    stopLoss: levels.stopLoss,
-
-    takeProfit: levels.takeProfit,
-
-    targetPips: levels.targetPips,
-
-    rr: levels.rr,
-
-    status: "open",
-
-    closedAt: null,
-
-    closePrice: null,
-
+    id: `${Date.now()}-${Math.floor(Math.random() * 100000)}`,
+    pair, time: Date.now(),
+    entryCandleTime: confirmation.time, // FIX: used to track result from the right candle
+    label: setup.structureBreak.type,
+    direction, entryPrice,
+    stopLoss: levels.stopLoss, takeProfit: levels.takeProfit,
+    targetPips: levels.targetPips, rr: levels.rr, score,
+    status: "open", closedAt: null, closePrice: null, resultR: null,
     setupDetails: {
-
-      bias: state.bias,
-
-      sweep: setup.sweep?.type,
-
-      zone: setup.supplyDemand?.type,
-
-      fvg: !!setup.fvg,
-
-      orderBlock: !!setup.orderBlock
-
+      bias: state.bias, htfStructure: htfInfo?.structure || "NEUTRAL",
+      sweep: setup.sweep?.type, zone: setup.supplyDemand?.type,
+      fvg: !!setup.fvg, orderBlock: !!setup.orderBlock, scoreReasons: scoreData.reasons
     }
-
   };
 
   signalHistory.unshift(signal);
+  if (signalHistory.length > MAX_SIGNAL_HISTORY) signalHistory.pop();
 
-  if (
-    signalHistory.length >
-    MAX_SIGNAL_HISTORY
-  ) {
-
-    signalHistory.pop();
-
-  }
-
-  state.lastSignalTime =
-    Date.now();
-
-  console.log(
-    `[SIGNAL FIRED] ${pair} ${direction} @ ${entryPrice} RR=${levels.rr.toFixed(2)}`
-  );
-
-  for (
-    const chatId of subscribers.keys()
-  ) {
-
-    bot.sendMessage(
-      chatId,
-      message
-    ).catch(err => {
-
-      console.error(
-        `Signal send failed ${chatId}:`,
-        err.message
-      );
-
-    });
-
-  }
-
+  state.lastSignalTime = Date.now();
+  state.lastAnalysis = `SIGNAL FIRED ${direction} ${score}/100`;
+  console.log(`[SIGNAL] ${pair} ${direction} @ ${entryPrice} score=${score} RR=${levels.rr.toFixed(2)}`);
+  broadcast(message);
+  return true;
 }
 
-
 // ================================================================
-// ANALYZE PAIR
+// ANALYZE
 // ================================================================
-
 function analyzePair(pair) {
+  const state = market[pair];
+  const htf = state.htfCandles;
+  const candles = state.entryCandles;
 
-  const state =
-    market[pair];
-
-  const htf =
-    state.htfCandles;
-
-  const candles =
-    state.entryCandles;
-
-  if (
-    htf.length < 55 ||
-    candles.length < 50
-  ) {
-
-    state.lastAnalysis =
-      "Building market history";
-
+  if (htf.length < 60 || candles.length < 80) {
+    state.lastAnalysis = `Building history (1H ${htf.length}/60, 15M ${candles.length}/80)`;
+    if (!state.lastDataError && state.dataStatus !== "OK") state.dataStatus = "LOADING";
     return;
-
   }
 
-  const latest =
-    candles[candles.length - 1];
+  const latest = candles[candles.length - 1];
+  state.lastPrice = latest.close;
 
-  state.lastPrice =
-    latest.close;
+  if (latest.time === state.lastProcessedCandleTime) return;
+  state.lastProcessedCandleTime = latest.time;
 
-  /*
-   * Avoid repeatedly processing the
-   * exact same candle.
-   */
-
-  if (
-    latest.time ===
-    state.lastProcessedCandleTime
-  ) {
-
-    return;
-
-  }
-
-  state.lastProcessedCandleTime =
-    latest.time;
-
-  const htfBias =
-    getHTFBias(htf);
-
-  state.bias =
-    htfBias;
-
-  const entryStructure =
-    getStructure(candles);
-
-  state.structure =
-    entryStructure.bias;
-
-  /*
-   * Existing setup
-   */
+  const htfInfo = getHTFBias(htf);
+  state.bias = htfInfo.bias;
+  state.structure = getStructure(candles).bias;
 
   if (state.pendingSetup) {
-
-    const setup =
-      state.pendingSetup;
-
-    if (
-      Date.now() -
-      setup.createdAt >
-      SETTINGS.SETUP_EXPIRY_MS
-    ) {
-
-      console.log(
-        `[${pair}] Setup expired`
-      );
-
-      state.pendingSetup = null;
-
-      state.lastAnalysis =
-        "Setup expired";
-
-      return;
-
+    const setup = state.pendingSetup;
+    if (Date.now() - setup.createdAt > SETTINGS.SETUP_EXPIRY_MS) {
+      state.pendingSetup = null; state.lastAnalysis = "Setup expired"; return;
     }
-
-    /*
-     * If HTF bias changed against setup,
-     * cancel it.
-     */
-
-    if (
-      (
-        setup.direction === "bullish" &&
-        htfBias !== "BULLISH"
-      ) ||
-      (
-        setup.direction === "bearish" &&
-        htfBias !== "BEARISH"
-      )
-    ) {
-
-      console.log(
-        `[${pair}] Setup cancelled: HTF bias changed`
-      );
-
-      state.pendingSetup = null;
-
-      state.lastAnalysis =
-        "Setup cancelled - HTF bias changed";
-
-      return;
-
+    const required = setup.direction === "bullish" ? "BULLISH" : "BEARISH";
+    if (htfInfo.bias !== required) {
+      state.pendingSetup = null; state.lastAnalysis = "Setup cancelled - HTF bias changed"; return;
     }
-
-    const confirm =
-      confirmationCandle(
-        candles,
-        setup
-      );
-
-    if (confirm) {
-
-      fireSignal(
-        pair,
-        setup,
-        confirm.close
-      );
-
+    const confirmation = confirmationCandle(candles, setup);
+    if (confirmation) {
+      fireSignal(pair, setup, confirmation, htfInfo);
       state.pendingSetup = null;
-
-      state.lastAnalysis =
-        "Signal fired";
-
       return;
-
     }
-
-    state.lastAnalysis =
-      `Waiting for ${setup.supplyDemand?.type || "zone"} retest`;
-
+    state.lastAnalysis = `WAITING for ${setup.direction.toUpperCase()} retest`;
     return;
-
   }
 
-  /*
-   * Don't create a new setup if a
-   * signal is already open.
-   */
+  if (hasOpenSignal(pair)) { state.lastAnalysis = "Signal open - tracking"; return; }
 
-  if (hasOpenSignal(pair)) {
-
-    state.lastAnalysis =
-      "Signal open - tracking result";
-
-    return;
-
+  if (htfInfo.bias !== "BULLISH" && htfInfo.bias !== "BEARISH") {
+    state.lastAnalysis = "NO TRADE - HTF neutral"; return;
   }
 
-  /*
-   * Only look for trades when HTF bias
-   * is clear.
-   */
-
-  if (
-    htfBias !== "BULLISH" &&
-    htfBias !== "BEARISH"
-  ) {
-
-    state.lastAnalysis =
-      "NO TRADE - HTF bias neutral";
-
-    return;
-
-  }
-
-  const setup =
-    buildSetup(
-      pair,
-      candles,
-      htfBias
-    );
-
+  const setup = buildSetup(pair, candles, htfInfo.bias);
   if (!setup) {
-
-    state.lastAnalysis =
-      `NO TRADE - waiting for liquidity + displacement + structure`;
-
-    return;
-
+    state.lastAnalysis = "NO TRADE - waiting for fresh liquidity + displacement + BOS"; return;
   }
 
-  state.pendingSetup =
-    setup;
-
-  state.lastAnalysis =
-    `Setup found - waiting for ${setup.supplyDemand.type} retest`;
-
-  console.log(
-    `[${pair}] ${setup.direction.toUpperCase()} setup found`
-  );
-
+  state.pendingSetup = setup;
+  state.lastAnalysis = `SETUP FOUND - waiting for ${setup.supplyDemand?.type || "ZONE"} retest`;
+  console.log(`[${pair}] Fresh ${setup.direction.toUpperCase()} setup found`);
 }
 
-
 // ================================================================
-// RESULT TRACKER
+// RESULT TRACKER  (FIX: checks every candle since entry, not just the last)
 // ================================================================
-
 function checkOpenSignals() {
+  const open = signalHistory.filter(s => s.status === "open");
 
-  const openSignals =
-    signalHistory.filter(
-      s => s.status === "open"
-    );
+  for (const signal of open) {
+    const state = market[signal.pair];
+    if (!state || !state.entryCandles.length) continue;
 
-  for (
-    const signal of openSignals
-  ) {
+    const after = state.entryCandles.filter(c => c.time > signal.entryCandleTime);
+    let result = null;
 
-    const state =
-      market[signal.pair];
-
-    if (
-      !state ||
-      state.entryCandles.length === 0
-    ) {
-
-      continue;
-
+    for (const c of after) {
+      const hitTP = signal.direction === "BUY" ? c.high >= signal.takeProfit : c.low <= signal.takeProfit;
+      const hitSL = signal.direction === "BUY" ? c.low <= signal.stopLoss : c.high >= signal.stopLoss;
+      // Conservative: if both hit inside one candle, count the loss
+      if (hitSL) { result = "loss"; break; }
+      if (hitTP) { result = "win"; break; }
     }
+    if (!result) continue;
 
-    const candle =
-      state.entryCandles[
-        state.entryCandles.length - 1
-      ];
+    signal.status = result;
+    signal.closePrice = result === "win" ? signal.takeProfit : signal.stopLoss;
+    signal.resultR = result === "win" ? signal.rr : -1;
+    signal.closedAt = Date.now();
+    state.lastSignalTime = Date.now();
 
-    let hitTP = false;
+    const dec = decimalsFor(signal.pair);
+    const isWin = result === "win";
 
-    let hitSL = false;
+    const text =
+`${isWin ? "🏆" : "🔴"} ${signal.pair} SIGNAL RESULT
 
-    /*
-     * IMPORTANT:
-     * We now use HIGH/LOW instead
-     * of candle CLOSE.
-     */
+${isWin ? "TAKE PROFIT HIT" : "STOP LOSS HIT"}
 
-    if (
-      signal.direction === "BUY"
-    ) {
+${signal.direction}
+Entry: ${signal.entryPrice.toFixed(dec)}
+Closed: ${signal.closePrice.toFixed(dec)}
 
-      hitTP =
-        candle.high >=
-        signal.takeProfit;
+⭐ Setup Score:
+${signal.score}/100
 
-      hitSL =
-        candle.low <=
-        signal.stopLoss;
+📐 R:
+${isWin ? "+" + signal.resultR.toFixed(2) + "R" : "-1R"}
 
-    } else {
-
-      hitTP =
-        candle.low <=
-        signal.takeProfit;
-
-      hitSL =
-        candle.high >=
-        signal.stopLoss;
-
-    }
-
-    /*
-     * If both were touched inside
-     * one candle, use conservative
-     * assumption: SL first.
-     */
-
-    if (hitSL) {
-
-      signal.status = "loss";
-
-      signal.closePrice =
-        signal.stopLoss;
-
-    } else if (hitTP) {
-
-      signal.status = "win";
-
-      signal.closePrice =
-        signal.takeProfit;
-
-    } else {
-
-      continue;
-
-    }
-
-    signal.closedAt =
-      Date.now();
-
-    market[
-      signal.pair
-    ].lastSignalTime =
-      Date.now();
-
-    const decimals =
-      decimalsFor(signal.pair);
-
-    const isWin =
-      signal.status === "win";
-
-    const resultEmoji =
-      isWin
-        ? "🏆"
-        : "🔴";
-
-    const resultText =
-      isWin
-        ? "TAKE PROFIT HIT"
-        : "STOP LOSS HIT";
-
-    const closeMessage =
-`${resultEmoji} ${signal.pair} SIGNAL RESULT
-
-${resultText}
-
-${signal.direction} @ ${signal.entryPrice.toFixed(decimals)}
-
-Closed @ ${signal.closePrice.toFixed(decimals)}
-
-${isWin
-  ? "🎯 Target reached."
-  : "🛡️ Stop loss reached."}
-
-📊 Result:
+📊 RESULT:
 ${isWin ? "WIN ✅" : "LOSS ❌"}`;
 
-    console.log(
-      `[RESULT] ${signal.pair} ${signal.direction} -> ${signal.status.toUpperCase()}`
-    );
-
-    for (
-      const chatId of subscribers.keys()
-    ) {
-
-      bot.sendMessage(
-        chatId,
-        closeMessage
-      ).catch(err => {
-
-        console.error(
-          `Result send failed ${chatId}:`,
-          err.message
-        );
-
-      });
-
-    }
-
+    console.log(`[RESULT] ${signal.pair} ${signal.direction} -> ${result.toUpperCase()}`);
+    broadcast(text);
   }
-
 }
 
+// ================================================================
+// STATS
+// ================================================================
+function getStats() {
+  const wins = signalHistory.filter(s => s.status === "win");
+  const losses = signalHistory.filter(s => s.status === "loss");
+  const decided = wins.length + losses.length;
+  const winRate = decided ? (wins.length / decided) * 100 : 0;
+  const totalR = [...wins, ...losses].reduce((sum, s) => sum + Number(s.resultR || 0), 0);
+  const grossProfit = wins.reduce((s, x) => s + Number(x.resultR || 0), 0);
+  const grossLoss = losses.reduce((s, x) => s + Math.abs(Number(x.resultR || 0)), 0);
+  const profitFactor = grossLoss > 0 ? grossProfit / grossLoss : grossProfit > 0 ? Infinity : 0;
+
+  let cur = 0, maxLossStreak = 0;
+  [...wins, ...losses].sort((a, b) => a.time - b.time).forEach(s => {
+    if (s.status === "loss") { cur++; maxLossStreak = Math.max(maxLossStreak, cur); } else cur = 0;
+  });
+
+  return {
+    wins: wins.length, losses: losses.length, decided, winRate, totalR, profitFactor, maxLossStreak,
+    open: signalHistory.filter(s => s.status === "open").length
+  };
+}
 
 // ================================================================
-// MAIN MARKET LOOP
+// MAIN LOOP  (FIX: runs just after each 15M candle closes)
 // ================================================================
-
 async function runCycle() {
-
   try {
-
-    console.log(
-      "=========================================="
-    );
-
-    console.log(
-      "🔄 Refreshing forex market data..."
-    );
-
+    console.log("==========================================");
+    console.log("🔄 Refreshing forex market data...");
     await fetchAllMarketData();
-
-    /*
-     * Check existing trades BEFORE
-     * hunting for new ones.
-     */
-
     checkOpenSignals();
-
+    PAIRS.forEach(analyzePair);
+    console.log(`[CYCLE] ${new Date().toISOString()}`);
     PAIRS.forEach(pair => {
-
-      analyzePair(pair);
-
+      const s = market[pair];
+      console.log(`${pair} | ${s.dataStatus} | 1H=${s.htfCandles.length} 15M=${s.entryCandles.length} | Price=${s.lastPrice || "-"} | Bias=${s.bias} | ${s.lastAnalysis}${s.lastDataError ? " | ERR: " + s.lastDataError : ""}`);
     });
-
-    console.log(
-      `[CYCLE] ${new Date().toLocaleString()}`
-    );
-
-    PAIRS.forEach(pair => {
-
-      const state =
-        market[pair];
-
-      console.log(
-        `${pair} | Price=${state.lastPrice || "-"} | Bias=${state.bias} | Structure=${state.structure} | ${state.lastAnalysis}`
-      );
-
-    });
-
   } catch (error) {
-
-    console.error(
-      "Market cycle error:",
-      error.response?.data ||
-      error.message
-    );
-
+    console.error("Market cycle error:", error.response?.data || error.message);
   }
-
 }
 
+function scheduleNextCycle() {
+  const now = Date.now();
+  const nextClose = Math.ceil((now + 1) / QUARTER_MS) * QUARTER_MS;
+  const delay = nextClose + SETTINGS.CYCLE_DELAY_AFTER_CLOSE_MS - now;
+  setTimeout(async () => {
+    await runCycle();
+    scheduleNextCycle();
+  }, delay);
+}
 
-/*
- * 15-minute strategy.
- *
- * The strategy now uses:
- *
- * 1H = direction
- * 15M = entry structure
- *
- * Refresh every 15 minutes.
- */
-
-const REFRESH_INTERVAL_MS =
-  15 * 60 * 1000;
-
-setInterval(
-  runCycle,
-  REFRESH_INTERVAL_MS
-);
-
-runCycle();
-
+// First load immediately, then follow the 15M candle clock
+runCycle().finally(scheduleNextCycle);
 
 // ================================================================
-// TELEGRAM /START
+// TELEGRAM
 // ================================================================
-
-bot.onText(
-  /\/start/,
-  msg => {
-
-    autoSubscribe(msg);
-
-    bot.sendMessage(
-      msg.chat.id,
-
-`💱 FOREX SIGNALS BOT V2
+bot.onText(/\/start/, msg => {
+  unsubscribed.delete(msg.chat.id);
+  autoSubscribe(msg);
+  bot.sendMessage(msg.chat.id,
+`💱 FOREX SIGNALS BOT V3
 
 Welcome 👋
 
 Markets:
-
 • EUR/USD
 • GBP/USD
 • USD/JPY
@@ -2275,1164 +929,271 @@ Markets:
 • USD/CAD
 • EUR/GBP
 
-🧠 NEW SIGNAL ENGINE
+🧠 V3 HIGH-CONFLUENCE ENGINE
 
-1️⃣ 1H market bias
-2️⃣ 15M structure
-3️⃣ Liquidity sweep
-4️⃣ Displacement
-5️⃣ BOS / CHoCH
-6️⃣ Supply / Demand
-7️⃣ FVG
-8️⃣ Order Block
+1️⃣ 1H directional bias
+2️⃣ 1H structure
+3️⃣ EMA alignment
+4️⃣ 15M liquidity sweep
+5️⃣ Displacement
+6️⃣ BOS / CHoCH
+7️⃣ Fresh Supply/Demand
+8️⃣ FVG / Order Block
 9️⃣ Retest
 🔟 Confirmation candle
+1️⃣1️⃣ Setup quality score
+1️⃣2️⃣ Minimum 1:2 RR
 
 🚫 Weak setups are rejected.
+🎯 Signals are selective.
+🛡️ Structure-based SL.
+📊 Results are tracked automatically.
 
-🎯 Dynamic TP
-📐 Minimum R:R
-🛡️ Structure-based SL
+🔔 Automatic alerts are ON.`, mainMenu);
+});
 
-🔔 Automatic alerts are ON.`,
+bot.on("message", async msg => {
+  if (!msg.text) return;
+  const id = msg.chat.id;
+  const text = msg.text;
 
-      mainMenu
-
-    );
-
+  if (text === "🔕 Stop Alerts") {
+    subscribers.delete(id);
+    unsubscribed.add(id);
+    return bot.sendMessage(id, "🔕 Alerts stopped. Press 🔔 Auto Signals to turn them back on.", mainMenu);
   }
-);
 
-
-// ================================================================
-// TELEGRAM MENU
-// ================================================================
-
-bot.on(
-  "message",
-  async msg => {
-
-    if (!msg.text) return;
-
+  if (text === "🔔 Auto Signals") {
+    unsubscribed.delete(id);
     autoSubscribe(msg);
+    return bot.sendMessage(id, "🔔 Automatic signals are ON.", mainMenu);
+  }
 
-    if (
-      msg.text ===
-      "📊 Market Status"
-    ) {
+  autoSubscribe(msg);
 
-      const lines =
-        PAIRS.map(pair => {
+  if (text === "📊 Market Status") {
+    const lines = PAIRS.map(pair => {
+      const s = market[pair];
+      if (s.dataStatus === "ERROR" && (s.htfCandles.length < 60 || s.entryCandles.length < 80))
+        return `${pair}: ❌ ${s.lastDataError || "API ERROR"}`;
+      if (s.htfCandles.length < 60 || s.entryCandles.length < 80)
+        return `${pair}: ⏳ Building history (1H ${s.htfCandles.length}/60, 15M ${s.entryCandles.length}/80)`;
+      if (hasOpenSignal(pair)) return `${pair}: 📈 SIGNAL ACTIVE | ${s.bias}`;
+      if (s.pendingSetup)
+        return `${pair}: 👀 ${s.pendingSetup.direction.toUpperCase()} SETUP | ${s.pendingSetup.supplyDemand?.type || "ZONE"}`;
+      return `${pair}: 🔎 ${s.bias} | ${s.lastAnalysis}`;
+    });
 
-          const state =
-            market[pair];
+    bot.sendMessage(id,
+`📊 FOREX MARKET STATUS V3
 
-          if (
-            state.entryCandles.length < 50
-          ) {
+${lines.join("\n")}
 
-            return `${pair}: ⏳ Building history`;
+⏱️ Checked after every 15M candle close
 
-          }
+🚫 NO TRADE means the engine did not find enough confirmation.
+⭐ The bot does NOT force trades.`);
+  }
 
-          if (
-            hasOpenSignal(pair)
-          ) {
+  if (text === "📖 How It Works") {
+    bot.sendMessage(id,
+`📖 FOREX SIGNAL ENGINE V3
 
-            return `${pair}: 📈 Signal active | ${state.bias}`;
+The engine is deliberately selective.
 
-          }
+🧠 STEP 1
+1H determines the directional bias.
 
-          if (
-            state.pendingSetup
-          ) {
+💧 STEP 2
+15M waits for liquidity to be taken.
 
-            return `${pair}: 👀 ${state.pendingSetup.direction.toUpperCase()} setup | ${state.pendingSetup.supplyDemand?.type || "ZONE"}`;
+⚡ STEP 3
+A strong displacement candle must appear.
 
-          }
+🔄 STEP 4
+Price must break structure.
 
-          return `${pair}: 🔎 ${state.bias} | ${state.lastAnalysis}`;
+🟦 STEP 5
+The move must create a valid Supply/Demand zone, FVG or Order Block.
 
-        });
+↩️ STEP 6
+Price must return to the fresh zone.
 
-      bot.sendMessage(
+✅ STEP 7
+A confirmation candle must reject the zone.
 
-        msg.chat.id,
+⭐ STEP 8
+The setup receives a quality score.
 
-`📊 FOREX MARKET STATUS
+📐 STEP 9
+The trade must have at least 1:2 risk/reward.
 
-${lines.join("\n")}`
+🚫 If the conditions are not strong enough:
 
-      );
+NO TRADE
 
-    }
+The engine does not manufacture signals.`);
+  }
 
-
-    if (
-      msg.text ===
-      "📖 How It Works"
-    ) {
-
-      bot.sendMessage(
-
-        msg.chat.id,
-
-`📖 FOREX SIGNAL ENGINE V2
-
-The bot does NOT enter simply because it sees BOS/CHoCH.
-
-It checks:
-
-1️⃣ 1H direction
-2️⃣ 15M structure
-3️⃣ Liquidity sweep
-4️⃣ Strong displacement
-5️⃣ BOS / CHoCH
-6️⃣ Supply/Demand location
-7️⃣ FVG
-8️⃣ Order Block
-9️⃣ Zone retest
-🔟 Confirmation candle
-1️⃣1️⃣ Risk/Reward
-
-If the conditions don't align:
-
-🚫 NO TRADE
-
-Results are checked using candle HIGH/LOW so TP/SL touches are detected more accurately.
-
-⏱️ Market refresh:
-Every 15 minutes.`
-
-      );
-
-    }
-
-
-    if (
-      msg.text ===
-      "⚙️ Settings"
-    ) {
-
-      const counts =
-        PAIRS.map(
-          p =>
-            `${p}: ${market[p].entryCandles.length} candles`
-        ).join("\n");
-
-      bot.sendMessage(
-
-        msg.chat.id,
-
-`⚙️ FOREX ENGINE V2
+  if (text === "⚙️ Settings") {
+    const counts = PAIRS.map(p => `${p}: ${market[p].htfCandles.length} × 1H, ${market[p].entryCandles.length} × 15M`).join("\n");
+    bot.sendMessage(id,
+`⚙️ FOREX ENGINE V3
 
 📊 Markets
 ${PAIRS.join(", ")}
 
-🧠 HTF
+🧠 Higher Timeframe
 1H
 
-📈 Entry
+📈 Entry Timeframe
 15M
 
-🎯 Minimum R:R
+⭐ Minimum Setup Score
+${SETTINGS.MIN_SIGNAL_SCORE}/100
+
+📐 Minimum R:R
 1:${SETTINGS.MIN_RR}
 
-🎯 Target range
+🎯 Target Range
 ${SETTINGS.MIN_TARGET_PIPS}-${SETTINGS.MAX_TARGET_PIPS} pips
 
+🛡️ SL Buffer
+${SETTINGS.SL_BUFFER_PIPS} pips
+
 🔔 Alerts
-ON
+${subscribers.has(id) ? "ON" : "OFF"}
 
-⏱️ Refresh
-Every 15 minutes
-
-${counts}`
-
-      );
-
-    }
-
+📊 HISTORY
+${counts}`);
   }
-);
-
-
-// ================================================================
-// ADMIN HELPERS
-// ================================================================
-
-function escapeHtml(str) {
-
-  if (
-    str === null ||
-    str === undefined
-  ) {
-
-    return "";
-
-  }
-
-  return String(str)
-
-    .replace(
-      /&/g,
-      "&amp;"
-    )
-
-    .replace(
-      /</g,
-      "&lt;"
-    )
-
-    .replace(
-      />/g,
-      "&gt;"
-    );
-
-}
-
-
-function formatUptime(ms) {
-
-  const totalMinutes =
-    Math.floor(ms / 60000);
-
-  return `${Math.floor(
-    totalMinutes / 60
-  )}h ${totalMinutes % 60}m`;
-
-}
-
+});
 
 // ================================================================
 // ADMIN PANEL
 // ================================================================
-
-app.get(
-  "/admin",
-  requireAdminAuth,
-  (req, res) => {
-
-    const pairRows =
-      PAIRS.map(pair => {
-
-        const state =
-          market[pair];
-
-        const price =
-          state.lastPrice;
-
-        const decimals =
-          decimalsFor(pair);
-
-        let status;
-
-        if (
-          hasOpenSignal(pair)
-        ) {
-
-          status =
-            "📈 Signal open";
-
-        } else if (
-          state.pendingSetup
-        ) {
-
-          status =
-            `👀 ${escapeHtml(
-              state.pendingSetup.direction
-            )} ${
-              state.pendingSetup.supplyDemand?.type ||
-              "ZONE"
-            }`;
-
-        } else {
-
-          status =
-            `🔎 ${escapeHtml(
-              state.lastAnalysis
-            )}`;
-
-        }
-
-        return `
-<tr>
-
-<td>${pair}</td>
-
-<td>
-${
-  price !== null
-    ? price.toFixed(decimals)
-    : "—"
+function escapeHtml(str) {
+  if (str === null || str === undefined) return "";
+  return String(str).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
-</td>
 
-<td>
-${state.bias}
-</td>
-
-<td>
-${state.structure}
-</td>
-
-<td>
-${status}
-</td>
-
-</tr>`;
-
-      }).join("");
-
-
-    const subscriberRows =
-      [...subscribers.entries()]
-        .map(
-          ([chatId, info]) => `
-
-<tr>
-
-<td>
-${escapeHtml(info.firstName)}
-${
-  info.username
-    ? " (@" +
-      escapeHtml(info.username) +
-      ")"
-    : ""
+function formatUptime(ms) {
+  const m = Math.floor(ms / 60000);
+  return `${Math.floor(m / 60)}h ${m % 60}m`;
 }
-</td>
 
-<td>${chatId}</td>
+app.get("/admin", requireAdminAuth, (req, res) => {
+  const stats = getStats();
 
-<td>
-${new Date(
-  info.joinedAt
-).toLocaleString()}
-</td>
+  const pairRows = PAIRS.map(pair => {
+    const s = market[pair];
+    const dec = decimalsFor(pair);
+    let status;
+    if (s.dataStatus === "ERROR" && s.entryCandles.length < 80) status = `❌ ${escapeHtml(s.lastDataError || "API ERROR")}`;
+    else if (hasOpenSignal(pair)) status = "📈 SIGNAL OPEN";
+    else if (s.pendingSetup) status = `👀 ${escapeHtml(s.pendingSetup.direction)} ${s.pendingSetup.supplyDemand?.type || "ZONE"}`;
+    else status = `🔎 ${escapeHtml(s.lastAnalysis)}`;
+    return `<tr><td>${pair}</td><td>${s.lastPrice !== null ? s.lastPrice.toFixed(dec) : "—"}</td><td>${escapeHtml(s.bias)}</td><td>${escapeHtml(s.structure)}</td><td>${status}</td><td>${s.htfCandles.length} / ${s.entryCandles.length}</td></tr>`;
+  }).join("");
 
-<td>
+  const subscriberRows = [...subscribers.entries()].map(([chatId, info]) =>
+    `<tr><td>${escapeHtml(info.firstName)}${info.username ? " (@" + escapeHtml(info.username) + ")" : ""}</td><td>${chatId}</td><td>${new Date(info.joinedAt).toLocaleString()}</td><td><form method="POST" action="/admin/remove" style="margin:0;"><input type="hidden" name="chatId" value="${chatId}"><button type="submit" class="danger">Remove</button></form></td></tr>`
+  ).join("") || `<tr><td colspan="4">No subscribers yet.</td></tr>`;
 
-<form
-method="POST"
-action="/admin/remove"
-style="margin:0;"
->
+  const badge = { open: "⏳ Open", win: "🏆 Win", loss: "❌ Loss" };
 
-<input
-type="hidden"
-name="chatId"
-value="${chatId}"
->
+  const signalRows = signalHistory.slice(0, 50).map(s => {
+    const dec = decimalsFor(s.pair);
+    const r = s.resultR === null || s.resultR === undefined ? "—" : (s.resultR >= 0 ? "+" : "") + s.resultR.toFixed(2) + "R";
+    return `<tr><td>${new Date(s.time).toLocaleString()}</td><td>${s.pair}</td><td>${escapeHtml(s.label)}</td><td>${s.direction}</td><td>${s.entryPrice.toFixed(dec)}</td><td>${s.stopLoss.toFixed(dec)}</td><td>${s.takeProfit.toFixed(dec)}</td><td>${badge[s.status] || s.status}</td><td>${s.score || "—"}</td><td>${r}</td></tr>`;
+  }).join("") || `<tr><td colspan="10">No signals fired yet.</td></tr>`;
 
-<button
-type="submit"
-class="danger"
->
-Remove
-</button>
+  const card = (label, value) => `<div class="card"><div class="label">${label}</div><div class="value">${value}</div></div>`;
 
-</form>
-
-</td>
-
-</tr>
-
-`
-        )
-        .join("")
-      ||
-      `
-<tr>
-<td colspan="4">
-No subscribers yet.
-</td>
-</tr>
-`;
-
-
-    const statusBadge = {
-
-      open: "⏳ Open",
-
-      win: "🏆 Win",
-
-      loss: "❌ Loss"
-
-    };
-
-
-    const signalRows =
-      signalHistory
-        .slice(0, 50)
-        .map(signal => {
-
-          const decimals =
-            decimalsFor(
-              signal.pair
-            );
-
-          return `
-
-<tr>
-
-<td>
-${new Date(
-  signal.time
-).toLocaleString()}
-</td>
-
-<td>
-${signal.pair}
-</td>
-
-<td>
-${signal.label}
-</td>
-
-<td>
-${signal.direction}
-</td>
-
-<td>
-${signal.entryPrice.toFixed(decimals)}
-</td>
-
-<td>
-${signal.stopLoss.toFixed(decimals)}
-</td>
-
-<td>
-${signal.takeProfit.toFixed(decimals)}
-</td>
-
-<td>
-${statusBadge[
-  signal.status
-] || signal.status}
-</td>
-
-</tr>
-
-`;
-
-        })
-        .join("")
-      ||
-      `
-<tr>
-<td colspan="8">
-No signals fired yet.
-</td>
-</tr>
-`;
-
-
-    const wins =
-      signalHistory.filter(
-        s => s.status === "win"
-      ).length;
-
-    const losses =
-      signalHistory.filter(
-        s => s.status === "loss"
-      ).length;
-
-    const openCount =
-      signalHistory.filter(
-        s => s.status === "open"
-      ).length;
-
-    const decided =
-      wins + losses;
-
-    const winRate =
-      decided > 0
-        ? (
-            wins /
-            decided *
-            100
-          ).toFixed(1)
-        : "—";
-
-
-    res.send(`
-
-<!DOCTYPE html>
-
-<html>
-
-<head>
-
-<meta
-name="viewport"
-content="width=device-width, initial-scale=1"
->
-
-<title>
-Forex Signals V2 - Admin
-</title>
-
+  res.send(`<!DOCTYPE html>
+<html><head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="60">
+<title>Forex Signals V3 - Admin</title>
 <style>
-
-body {
-
-font-family:
--apple-system,
-BlinkMacSystemFont,
-Arial,
-sans-serif;
-
-background:
-#0f1115;
-
-color:
-#eee;
-
-margin:
-0;
-
-padding:
-16px;
-
-}
-
-h1 {
-
-font-size:
-1.3rem;
-
-}
-
-h2 {
-
-font-size:
-1.05rem;
-
-margin-top:
-28px;
-
-color:
-#f5c542;
-
-}
-
-.stats {
-
-display:
-flex;
-
-flex-wrap:
-wrap;
-
-gap:
-10px;
-
-margin:
-12px 0;
-
-}
-
-.card {
-
-background:
-#1b1f27;
-
-border-radius:
-10px;
-
-padding:
-12px 16px;
-
-flex:
-1 1 140px;
-
-}
-
-.card .label {
-
-font-size:
-0.75rem;
-
-color:
-#999;
-
-}
-
-.card .value {
-
-font-size:
-1.3rem;
-
-font-weight:
-bold;
-
-margin-top:
-4px;
-
-}
-
-table {
-
-width:
-100%;
-
-border-collapse:
-collapse;
-
-margin-top:
-8px;
-
-font-size:
-0.82rem;
-
-}
-
-th,
-td {
-
-text-align:
-left;
-
-padding:
-8px 6px;
-
-border-bottom:
-1px solid #2a2f3a;
-
-white-space:
-nowrap;
-
-}
-
-th {
-
-color:
-#aaa;
-
-font-weight:
-normal;
-
-}
-
-button {
-
-background:
-#2b6fe0;
-
-color:
-white;
-
-border:
-none;
-
-padding:
-8px 14px;
-
-border-radius:
-6px;
-
-font-size:
-0.85rem;
-
-}
-
-button.danger {
-
-background:
-#c0392b;
-
-}
-
-textarea {
-
-width:
-100%;
-
-box-sizing:
-border-box;
-
-background:
-#1b1f27;
-
-color:
-#eee;
-
-border:
-1px solid #333;
-
-border-radius:
-6px;
-
-padding:
-8px;
-
-font-size:
-0.9rem;
-
-}
-
-.scroll {
-
-overflow-x:
-auto;
-
-}
-
-.note {
-
-background:
-#171b22;
-
-padding:
-12px;
-
-border-radius:
-8px;
-
-margin:
-10px 0;
-
-line-height:
-1.5;
-
-}
-
-</style>
-
-</head>
-
-<body>
-
-
-<h1>
-💱 Forex Signals Engine V2
-</h1>
-
-
-<div class="note">
-
-<b>Strategy:</b>
-
-1H Bias →
-15M Structure →
-Liquidity Sweep →
-Displacement →
-BOS/CHoCH →
-Supply/Demand →
-FVG/OB →
-Retest →
-Confirmation
-
-</div>
-
-
+body{font-family:-apple-system,BlinkMacSystemFont,Arial,sans-serif;background:#0f1115;color:#eee;margin:0;padding:16px}
+h1{font-size:1.3rem} h2{font-size:1.05rem;margin-top:28px;color:#f5c542}
+.stats{display:flex;flex-wrap:wrap;gap:10px;margin:12px 0}
+.card{background:#1b1f27;border-radius:10px;padding:12px 16px;flex:1 1 140px}
+.card .label{font-size:.75rem;color:#999} .card .value{font-size:1.3rem;font-weight:bold;margin-top:4px}
+table{width:100%;border-collapse:collapse;margin-top:8px;font-size:.82rem}
+th,td{text-align:left;padding:8px 6px;border-bottom:1px solid #2a2f3a;white-space:nowrap}
+th{color:#aaa;font-weight:normal}
+button{background:#2b6fe0;color:#fff;border:none;padding:8px 14px;border-radius:6px;font-size:.85rem}
+button.danger{background:#c0392b}
+textarea{width:100%;box-sizing:border-box;background:#1b1f27;color:#eee;border:1px solid #333;border-radius:6px;padding:8px;font-size:.9rem}
+.scroll{overflow-x:auto}
+.note{background:#171b22;padding:12px;border-radius:8px;margin:10px 0;line-height:1.5}
+</style></head><body>
+<h1>💱 Forex Signals Engine V3</h1>
+<div class="note"><b>Strategy:</b> 1H Bias → 1H Structure → EMA → Liquidity Sweep → Displacement → BOS/CHoCH → Fresh Zone → FVG/OB → Retest → Confirmation → Score → Minimum 1:2 RR</div>
 <div class="stats">
-
-
-<div class="card">
-
-<div class="label">
-Bot uptime
+${card("Bot uptime", formatUptime(Date.now() - botStartedAt))}
+${card("Subscribers", subscribers.size)}
+${card("Signals", signalHistory.length)}
 </div>
-
-<div class="value">
-${formatUptime(
-  Date.now() -
-  botStartedAt
-)}
-</div>
-
-</div>
-
-
-<div class="card">
-
-<div class="label">
-Subscribers
-</div>
-
-<div class="value">
-${subscribers.size}
-</div>
-
-</div>
-
-
-<div class="card">
-
-<div class="label">
-Signals
-</div>
-
-<div class="value">
-${signalHistory.length}
-</div>
-
-</div>
-
-
-</div>
-
-
 <div class="stats">
-
-
-<div class="card">
-
-<div class="label">
-Win rate
+${card("Win rate", stats.decided ? stats.winRate.toFixed(1) + "%" : "—")}
+${card("Total R", (stats.totalR >= 0 ? "+" : "") + stats.totalR.toFixed(2) + "R")}
+${card("Profit factor", stats.profitFactor === Infinity ? "∞" : stats.profitFactor.toFixed(2))}
+${card("Max loss streak", stats.maxLossStreak)}
+${card("Wins", stats.wins)}
+${card("Losses", stats.losses)}
+${card("Open", stats.open)}
 </div>
-
-<div class="value">
-${winRate}
-${
-  decided > 0
-    ? "%"
-    : ""
-}
-</div>
-
-</div>
-
-
-<div class="card">
-
-<div class="label">
-Wins
-</div>
-
-<div class="value">
-${wins}
-</div>
-
-</div>
-
-
-<div class="card">
-
-<div class="label">
-Losses
-</div>
-
-<div class="value">
-${losses}
-</div>
-
-</div>
-
-
-<div class="card">
-
-<div class="label">
-Open
-</div>
-
-<div class="value">
-${openCount}
-</div>
-
-</div>
-
-
-</div>
-
-
-<h2>
-Markets
-</h2>
-
-
-<div class="scroll">
-
-<table>
-
-<tr>
-
-<th>
-Pair
-</th>
-
-<th>
-Price
-</th>
-
-<th>
-1H Bias
-</th>
-
-<th>
-15M Structure
-</th>
-
-<th>
-Status
-</th>
-
-</tr>
-
+<h2>Markets</h2>
+<div class="scroll"><table>
+<tr><th>Pair</th><th>Price</th><th>1H Bias</th><th>15M Structure</th><th>Status</th><th>Candles 1H / 15M</th></tr>
 ${pairRows}
-
-</table>
-
-</div>
-
-
-<h2>
-Broadcast
-</h2>
-
-
-<form
-method="POST"
-action="/admin/broadcast"
->
-
-<textarea
-name="message"
-rows="3"
-placeholder="Type a message..."
-></textarea>
-
-<br>
-<br>
-
-<button
-type="submit"
->
-Send Broadcast
-</button>
-
+</table></div>
+<h2>Broadcast</h2>
+<form method="POST" action="/admin/broadcast">
+<textarea name="message" rows="3" placeholder="Type a message..."></textarea><br><br>
+<button type="submit">Send Broadcast</button>
 </form>
-
-
-<h2>
-Subscribers (${subscribers.size})
-</h2>
-
-
-<div class="scroll">
-
-<table>
-
-<tr>
-
-<th>
-Name
-</th>
-
-<th>
-Chat ID
-</th>
-
-<th>
-Joined
-</th>
-
-<th>
-Action
-</th>
-
-</tr>
-
+<h2>Subscribers (${subscribers.size})</h2>
+<div class="scroll"><table>
+<tr><th>Name</th><th>Chat ID</th><th>Joined</th><th>Action</th></tr>
 ${subscriberRows}
-
-</table>
-
-</div>
-
-
-<h2>
-Recent Signals
-</h2>
-
-
-<div class="scroll">
-
-<table>
-
-<tr>
-
-<th>
-Time
-</th>
-
-<th>
-Pair
-</th>
-
-<th>
-Type
-</th>
-
-<th>
-Direction
-</th>
-
-<th>
-Entry
-</th>
-
-<th>
-SL
-</th>
-
-<th>
-TP
-</th>
-
-<th>
-Result
-</th>
-
-</tr>
-
+</table></div>
+<h2>Recent Signals</h2>
+<div class="scroll"><table>
+<tr><th>Time</th><th>Pair</th><th>Type</th><th>Direction</th><th>Entry</th><th>SL</th><th>TP</th><th>Result</th><th>Score</th><th>R</th></tr>
 ${signalRows}
+</table></div>
+</body></html>`);
+});
 
-</table>
+app.post("/admin/remove", requireAdminAuth, (req, res) => {
+  const id = Number(req.body.chatId);
+  subscribers.delete(id);
+  unsubscribed.add(id);
+  res.redirect("/admin");
+});
 
-</div>
-
-
-</body>
-
-</html>
-
-`);
-
-  }
-);
-
-
-// ================================================================
-// ADMIN REMOVE USER
-// ================================================================
-
-app.post(
-  "/admin/remove",
-  requireAdminAuth,
-  (req, res) => {
-
-    subscribers.delete(
-      Number(req.body.chatId)
-    );
-
-    res.redirect("/admin");
-
-  }
-);
-
+app.post("/admin/broadcast", requireAdminAuth, (req, res) => {
+  const message = (req.body.message || "").trim();
+  if (message) broadcast(`📢 ${message}`);
+  res.redirect("/admin");
+});
 
 // ================================================================
-// ADMIN BROADCAST
+// SHUTDOWN / START
 // ================================================================
+async function shutdown() {
+  try { await bot.stopPolling(); } catch (err) { console.error("Error stopping polling:", err.message); }
+  process.exit(0);
+}
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
 
-app.post(
-  "/admin/broadcast",
-  requireAdminAuth,
-  async (req, res) => {
-
-    const message =
-      (req.body.message || "")
-        .trim();
-
-    if (message) {
-
-      for (
-        const chatId of subscribers.keys()
-      ) {
-
-        bot.sendMessage(
-          chatId,
-          `📢 ${message}`
-        ).catch(err => {
-
-          console.error(
-            `Broadcast failed ${chatId}:`,
-            err.message
-          );
-
-        });
-
-      }
-
-    }
-
-    res.redirect("/admin");
-
-  }
-);
-
-
-// ================================================================
-// CLEAN SHUTDOWN
-// ================================================================
-
-process.on(
-  "SIGTERM",
-  async () => {
-
-    try {
-
-      await bot.stopPolling();
-
-    } catch (err) {
-
-      console.error(
-        "Error stopping polling:",
-        err.message
-      );
-
-    }
-
-    process.exit(0);
-
-  }
-);
-
-
-process.on(
-  "SIGINT",
-  async () => {
-
-    try {
-
-      await bot.stopPolling();
-
-    } catch (err) {
-
-      console.error(
-        "Error stopping polling:",
-        err.message
-      );
-
-    }
-
-    process.exit(0);
-
-  }
-);
-
-
-// ================================================================
-// START SERVER
-// ================================================================
-
-app.listen(
-  PORT,
-  () => {
-
-    console.log(
-      `💱 FOREX SIGNALS BOT V2 running on port ${PORT}`
-    );
-
-    console.log(
-      `📊 Markets: ${PAIRS.join(", ")}`
-    );
-
-    console.log(
-      "🧠 Strategy: 1H Bias + 15M Structure + Liquidity + Supply/Demand + FVG + OB"
-    );
-
-  }
-);
+app.listen(PORT, () => {
+  console.log(`💱 FOREX SIGNALS BOT V3 running on port ${PORT}`);
+  console.log(`📊 Markets: ${PAIRS.join(", ")}`);
+  console.log(`⭐ Minimum score: ${SETTINGS.MIN_SIGNAL_SCORE}/100 | 📐 Minimum RR: 1:${SETTINGS.MIN_RR}`);
+});
